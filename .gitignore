@@ -1,0 +1,13 @@
+# Preprocessing runs. R/run_preprocessing.R writes here by default, and a run
+# holds the cleaned data plus every diagnostic figure -- all reproducible from
+# the raw extract and the config, so it does not belong in the history.
+outputs/
+42/
+data/
+models/
+
+# R session and device leftovers
+.Rhistory
+.RData
+.Rproj.user/
+Rplots.pdf

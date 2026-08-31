@@ -1,0 +1,1375 @@
+#############################################################
+#############################################################
+###
+### Specification and fitting of the MARSS data fusion model.
+###
+### Turns the observation matrix written by the preprocessing
+### step, plus a configuration from parameters/model.R, into
+### the list of fixed and estimated matrices that MARSS()
+### takes, and runs the fit.
+###
+### Every hard coded choice in the earlier exploratory
+### scripts -- which sites, which dates, which instruments
+### share a mean or a seasonal cycle, how the states are
+### structured -- is a configuration value here, so a fit is
+### fully described by its config file.
+###
+### The observation equation is
+###
+###   y_t = Z x_t + a + D d_t + v_t,   v_t ~ N(0, R)
+###
+### and the state equation is
+###
+###   x_t = B x_{t-1} + w_t,           w_t ~ N(0, Q)
+###
+### where d_t holds the seasonal harmonics.
+###
+### Jack H. Buckner, Oregon State University, 08/30/2026
+### Generated with Claude Code
+###
+#############################################################
+#############################################################
+
+library(MARSS)
+
+# Present in run_preprocessing.R as well; repeated so this file can be sourced
+# on its own.
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# Internal: rank the unique values of x, so a subset of sites is renumbered
+# 1..n without gaps. Defined here rather than taken from dplyr, which is not
+# otherwise needed by the model step.
+.dense_rank <- function(x) {
+  if (all(is.na(x))) return(as.integer(x))
+  match(x, sort(unique(x)))
+}
+
+# The intercept and seasonality parameterisations a config may name.
+.INTERCEPT_KINDS  <- c("site", "site+instrument", "independent", "zero")
+.SEASONALITY_KINDS <- c("shared", "independent")
+.STATE_STRUCTURES  <- c("site_plus_factors", "factors_only")
+
+# Fitting methods MARSS accepts. "kem" is the EM algorithm; everything else
+# optimises the likelihood directly through optim() or nlminb(), which imposes
+# a constraint on R -- see `.needs_diagonal_R()`.
+.METHODS <- c("kem", "BFGS", "TMB", "BFGS_TMB", "nlminb_TMB")
+
+# Only EM can fit a block structured R. The direct optimisers require every
+# block of a variance-covariance matrix to be fixed, diagonal, or wholly
+# unconstrained; a diagonal of per instrument variances with a single shared
+# off-diagonal covariance is none of those.
+.needs_diagonal_R <- function(method) !identical(method, "kem")
+
+# Instruments whose day effect puts a shared covariance into the off-diagonal
+# of R, which is what the direct optimisers cannot handle.
+.day_effect_vars <- function(config) {
+  ins <- config$structure$instruments
+  if (!is.list(ins)) return(character(0))
+  names(ins)[vapply(ins, function(s) isTRUE(s$day_effect), logical(1))]
+}
+
+# TMB does not estimate B: it returns whatever value B started at, without
+# saying so. Holding B at a stated value is therefore a modelling choice for
+# the initialisation stage, not a tuning knob, and `B_values` makes it explicit
+# rather than leaving it to MARSS's default of 1 (a random walk).
+#
+# The free entries of B depend on the state structure, so the names are listed
+# here once and validation checks `B_values` against them without having to
+# build the model.
+.b_param_names <- function(config) {
+  if (identical(config$structure$state_structure, "site_plus_factors"))
+    c("rho_chi", "rho_eta") else "rho"
+}
+
+# Turn a scalar or a named list of B values into one named numeric vector
+# covering every free entry. Errors naming whatever is missing.
+.resolve_b_values <- function(names, B_values) {
+
+  if (is.numeric(B_values) && length(B_values) == 1L && is.null(names(B_values)))
+    return(stats::setNames(rep(as.numeric(B_values), length(names)), names))
+
+  if (!is.list(B_values) && !(is.numeric(B_values) && !is.null(names(B_values))))
+    stop("`init$B_values` must be a single number or a named list.",
+         call. = FALSE)
+
+  vals   <- unlist(B_values)
+  absent <- setdiff(names, names(vals))
+  if (length(absent))
+    stop("`init$B_values` has no value for: ", paste(absent, collapse = ", "),
+         ". The free entries of B for this state structure are: ",
+         paste(names, collapse = ", "), call. = FALSE)
+
+  stats::setNames(as.numeric(vals[names]), names)
+}
+
+# Derive the stage 1 configuration from the full one: the initialisation method
+# and its controls, a single pass, no day effects (the direct optimisers cannot
+# fit the off-diagonal they add), and B held at the configured values.
+#
+# Dropping the day effects here is safe in a way that dropping them from the
+# final fit would not be: stage 1 exists only to supply starting values, and the
+# parameters it cannot estimate are simply not transferred.
+.init_config <- function(config) {
+
+  init <- config$fitting$init
+  cfg  <- config
+
+  cfg$fitting$method                <- init$method
+  cfg$fitting$controls[[init$method]] <- init$controls
+  cfg$fitting$chunks                <- 1L
+
+  for (v in names(cfg$structure$instruments))
+    cfg$structure$instruments[[v]]$day_effect <- FALSE
+
+  cfg$structure$B_fixed <-
+    .resolve_b_values(.b_param_names(config), init$B_values)
+
+  cfg
+}
+
+
+#' Read a model configuration
+#'
+#' Accepts either a path to a config R file or an already-built list. A path is
+#' sourced into a private environment, so nothing lands in the global
+#' environment and the file can live anywhere. Mirrors `read_config()` in
+#' 00_preprocessing.R.
+#'
+#' @param config Path to a config file defining `model_config`, or the list
+#'   itself.
+#' @return The `model_config` list.
+#' @export
+read_model_config <- function(config) {
+  if (is.list(config)) return(config)
+  if (!is.character(config) || length(config) != 1)
+    stop("`config` must be a file path or a configuration list.", call. = FALSE)
+  if (!file.exists(config)) stop("Config file not found: ", config, call. = FALSE)
+
+  env <- new.env(parent = globalenv())
+  sys.source(normalizePath(config), envir = env)
+  if (!exists("model_config", envir = env, inherits = FALSE))
+    stop("Config file '", config, "' does not define `model_config`.",
+         call. = FALSE)
+  get("model_config", envir = env, inherits = FALSE)
+}
+
+
+#' Validate a model configuration against the data it will be fit to
+#'
+#' Every problem found is collected and reported in a single error, rather than
+#' surfacing one at a time over successive runs -- most of these failures are
+#' otherwise silent. A misspelled instrument name leaves those rows with a fixed
+#' zero intercept and no error term, which fits happily and means nothing.
+#'
+#' @param config The `model_config` list.
+#' @param marss_inputs Optionally the `marss_inputs.rds` contents the model will
+#'   be fit to. When supplied, the site, date and variable names in the config
+#'   are checked against it.
+#'
+#' @return `config`, invisibly, if it is valid. Otherwise an error listing every
+#'   problem found.
+#' @export
+validate_model_config <- function(config, marss_inputs = NULL) {
+
+  if (!is.list(config)) stop("`config` must be a list.", call. = FALSE)
+  problems <- character()
+  add <- function(...) problems <<- c(problems, paste0(...))
+
+  required <- c("data", "scaling", "structure", "inits", "fitting", "output")
+  absent   <- setdiff(required, names(config))
+  if (length(absent))
+    add("Missing required config key(s): ", paste(absent, collapse = ", "))
+
+  # A config without a `reconstruction` block is still valid: the step then
+  # runs on its defaults, which is what every config predating it does.
+  optional <- "reconstruction"
+
+  extra <- setdiff(names(config), c(required, optional))
+  if (length(extra))
+    warning("Unrecognised config key(s), which will be ignored: ",
+            paste(extra, collapse = ", "),
+            ". Check for a typo against: ",
+            paste(c(required, optional), collapse = ", "),
+            call. = FALSE, immediate. = TRUE)
+
+  known_vars  <- marss_inputs$row_var_keys
+  known_sites <- marss_inputs$row_site_keys
+
+  # ---- data ----------------------------------------------------------------
+  dp <- config$data
+  if (!is.list(dp)) {
+    add("`data` must be a list.")
+  } else {
+    if (!is.character(dp$input) || length(dp$input) != 1 || !nzchar(dp$input))
+      add("`data$input` must be a single non-empty path.")
+    if (!is.null(dp$sites)) {
+      if (!is.character(dp$sites) || !length(dp$sites)) {
+        add("`data$sites` must be a character vector, or NULL for all sites.")
+      } else if (!is.null(known_sites)) {
+        miss <- setdiff(dp$sites, known_sites)
+        if (length(miss))
+          add("`data$sites` names site(s) absent from the data: ",
+              paste(miss, collapse = ", "), ". Available: ",
+              paste(sort(unique(known_sites)), collapse = ", "))
+      }
+    }
+    for (k in c("start_date", "end_date")) {
+      v <- dp[[k]]
+      if (!is.null(v) && is.na(suppressWarnings(as.Date(v))))
+        add("`data$", k, "` is not a date: ", v)
+    }
+  }
+
+  # ---- scaling -------------------------------------------------------------
+  sc <- config$scaling
+  if (!is.list(sc)) {
+    add("`scaling` must be a list.")
+  } else if (isTRUE(sc$enabled)) {
+    if (!is.character(sc$variable) || length(sc$variable) != 1)
+      add("`scaling$variable` must name a single variable.")
+    else if (!is.null(known_vars) && !sc$variable %in% known_vars)
+      add("`scaling$variable` = '", sc$variable, "' is not in the data.")
+    # Scaling is per site, so the reference has to reach every site rather than
+    # being one nominated series.
+    if (!is.null(sc$site))
+      warning("`scaling$site` is no longer used: scaling is per site, taken ",
+              "from `scaling$variable` at each site.",
+              call. = FALSE, immediate. = TRUE)
+  }
+
+  # ---- structure -----------------------------------------------------------
+  st <- config$structure
+  if (!is.list(st)) {
+    add("`structure` must be a list.")
+  } else {
+    if (!is.character(st$state_structure) ||
+        length(st$state_structure) != 1 ||
+        !st$state_structure %in% .STATE_STRUCTURES)
+      add("`structure$state_structure` must be one of: ",
+          paste(.STATE_STRUCTURES, collapse = ", "))
+
+    m <- st$m_factors
+    if (!is.numeric(m) || length(m) != 1 || is.na(m) || m < 1 ||
+        m != as.integer(m)) {
+      add("`structure$m_factors` must be a single positive integer.")
+    } else if (!is.null(known_sites)) {
+      keep <- if (is.null(config$data$sites)) known_sites else
+        known_sites[known_sites %in% config$data$sites]
+      n_site <- length(unique(keep))
+      if (n_site && m > n_site)
+        add("`structure$m_factors` (", m, ") exceeds the number of sites (",
+            n_site, "): an m-factor model needs at least m sites.")
+    }
+
+    ins <- st$instruments
+    if (!is.list(ins) || !length(ins) || is.null(names(ins)) ||
+        !all(nzchar(names(ins)))) {
+      add("`structure$instruments` must be a non-empty named list.")
+    } else {
+      if (!is.null(known_vars)) {
+        miss <- setdiff(names(ins), known_vars)
+        if (length(miss))
+          add("`structure$instruments` names variable(s) absent from the data: ",
+              paste(miss, collapse = ", "))
+        # The dangerous direction: rows the config says nothing about get a
+        # fixed zero intercept and no error term, and fit silently.
+        keep_rows <- if (is.null(config$data$sites)) rep(TRUE, length(known_vars))
+                     else known_sites %in% config$data$sites
+        unspoken <- setdiff(unique(known_vars[keep_rows]), names(ins))
+        if (length(unspoken))
+          add("The data contain variable(s) with no `structure$instruments` ",
+              "entry, which would enter the model with no intercept and no ",
+              "error term: ", paste(unspoken, collapse = ", "))
+      }
+      for (v in names(ins)) {
+        s <- ins[[v]]
+        if (!is.list(s)) { add("`instruments$", v, "` must be a list."); next }
+        if (!is.character(s$tag) || length(s$tag) != 1 || !nzchar(s$tag))
+          add("`instruments$", v, "$tag` must be a single non-empty string.")
+        if (!isTRUE(s$intercept %in% .INTERCEPT_KINDS))
+          add("`instruments$", v, "$intercept` must be one of: ",
+              paste(.INTERCEPT_KINDS, collapse = ", "))
+        if (!isTRUE(s$seasonality %in% .SEASONALITY_KINDS))
+          add("`instruments$", v, "$seasonality` must be one of: ",
+              paste(.SEASONALITY_KINDS, collapse = ", "))
+        if (!is.character(s$error) || length(s$error) != 1 || !nzchar(s$error))
+          add("`instruments$", v, "$error` must name an observation variance.")
+        if (!is.null(s$day_effect) &&
+            (!is.logical(s$day_effect) || length(s$day_effect) != 1 ||
+             is.na(s$day_effect)))
+          add("`instruments$", v, "$day_effect` must be TRUE or FALSE.")
+        if (!is.logical(s$site_state) || length(s$site_state) != 1 ||
+            is.na(s$site_state))
+          add("`instruments$", v, "$site_state` must be TRUE or FALSE.")
+      }
+      tags <- vapply(ins, function(s) as.character(s$tag %||% NA), character(1))
+      if (anyDuplicated(tags[!is.na(tags)]))
+        add("`structure$instruments` has duplicate `tag` values, which would ",
+            "collide in the parameter names: ",
+            paste(unique(tags[duplicated(tags)]), collapse = ", "))
+    }
+
+    v0 <- st$init_var_x0
+    if (!is.numeric(v0) || length(v0) != 1 || !is.finite(v0) || v0 <= 0)
+      add("`structure$init_var_x0` must be a single positive number.")
+  }
+
+  # ---- inits ---------------------------------------------------------------
+  it <- config$inits
+  if (!is.list(it)) {
+    add("`inits` must be a list.")
+  } else if (isTRUE(it$enabled)) {
+    v <- it$shared_from
+    if (!is.character(v) || length(v) != 1) {
+      add("`inits$shared_from` must name a single variable.")
+    } else {
+      if (!is.null(known_vars) && !v %in% known_vars)
+        add("`inits$shared_from` = '", v, "' is not in the data.")
+      if (is.list(config$structure$instruments) &&
+          !v %in% names(config$structure$instruments))
+        add("`inits$shared_from` = '", v, "' has no `structure$instruments` ",
+            "entry, so it is not part of the model.")
+    }
+    if (!is.logical(it$seed_independent) || length(it$seed_independent) != 1 ||
+        is.na(it$seed_independent))
+      add("`inits$seed_independent` must be TRUE or FALSE.")
+    if (!is.numeric(it$min_obs) || length(it$min_obs) != 1 ||
+        !is.finite(it$min_obs) || it$min_obs < 1)
+      add("`inits$min_obs` must be a single positive number.")
+  }
+
+  # ---- fitting -------------------------------------------------------------
+  ft <- config$fitting
+  if (!is.list(ft)) {
+    add("`fitting` must be a list.")
+  } else {
+
+    method <- ft$method
+    if (!is.character(method) || length(method) != 1 ||
+        !method %in% .METHODS) {
+      add("`fitting$method` must be one of: ", paste(.METHODS, collapse = ", "))
+      method <- NA_character_
+    }
+
+    # Each method has its own set of legal control names -- MARSS rejects a
+    # control belonging to another method outright -- so the controls are keyed
+    # by method rather than shared.
+    if (!is.list(ft$controls) || is.null(names(ft$controls))) {
+      add("`fitting$controls` must be a list keyed by method name, e.g. ",
+          "list(kem = list(...), TMB = list(...)).")
+    } else if (!is.na(method) && !method %in% names(ft$controls)) {
+      add("`fitting$controls` has no entry for method '", method,
+          "'. Present: ", paste(names(ft$controls), collapse = ", "))
+    }
+
+    if (!is.list(ft$warmup_controls))
+      add("`fitting$warmup_controls` must be a list.")
+    if (!is.numeric(ft$chunks) || length(ft$chunks) != 1 ||
+        is.na(ft$chunks) || ft$chunks < 1)
+      add("`fitting$chunks` must be a single positive integer.")
+
+    # The check the whole method option turns on. A day effect puts a shared
+    # covariance in the off-diagonal of R, and only EM can fit that; the direct
+    # optimisers require each block of a variance-covariance matrix to be fixed,
+    # diagonal, or wholly unconstrained. Caught here rather than several minutes
+    # into a run, where MARSS reports it as a model specification problem
+    # without saying which setting caused it.
+    if (!is.na(method) && .needs_diagonal_R(method)) {
+      with_day <- .day_effect_vars(config)
+      if (length(with_day))
+        add("`fitting$method` = '", method, "' cannot fit the day effect on: ",
+            paste(with_day, collapse = ", "),
+            ". A day effect is a shared covariance in the off-diagonal of R, ",
+            "which only method 'kem' can estimate. Either set ",
+            "`day_effect = FALSE` for those instruments, or fit with 'kem'.")
+    }
+
+    # ---- fitting$init ------------------------------------------------------
+    it <- ft$init
+    if (!is.null(it)) {
+      if (!is.list(it)) {
+        add("`fitting$init` must be a list, or absent.")
+      } else if (isTRUE(it$enabled)) {
+
+        if (!is.character(it$method) || length(it$method) != 1 ||
+            !it$method %in% .METHODS)
+          add("`fitting$init$method` must be one of: ",
+              paste(.METHODS, collapse = ", "))
+        if (!is.list(it$controls))
+          add("`fitting$init$controls` must be a list.")
+
+        # Checked here as well as at build time so a bad value is reported
+        # alongside every other problem rather than stopping the run alone.
+        ok_scalar <- is.numeric(it$B_values) && length(it$B_values) == 1L &&
+                     is.null(names(it$B_values))
+        if (ok_scalar) {
+          if (!is.finite(it$B_values))
+            add("`fitting$init$B_values` must be a finite number.")
+        } else if (is.list(it$B_values) ||
+                   (is.numeric(it$B_values) && !is.null(names(it$B_values)))) {
+          need <- .b_param_names(config)
+          have <- names(unlist(it$B_values))
+          absent <- setdiff(need, have)
+          if (length(absent))
+            add("`fitting$init$B_values` has no value for: ",
+                paste(absent, collapse = ", "),
+                ". The free entries of B for state structure '",
+                config$structure$state_structure %||% "?", "' are: ",
+                paste(need, collapse = ", "))
+        } else {
+          add("`fitting$init$B_values` must be a single number or a named list.")
+        }
+      }
+    }
+  }
+
+  # ---- output --------------------------------------------------------------
+  op <- config$output
+  if (!is.list(op)) {
+    add("`output` must be a list.")
+  } else {
+    if (!is.null(op$output_root) &&
+        (!is.character(op$output_root) || length(op$output_root) != 1))
+      add("`output$output_root` must be a single path, or NULL.")
+    if (!is.null(op$run_name) &&
+        (!is.character(op$run_name) || length(op$run_name) != 1))
+      add("`output$run_name` must be a single name, or NULL.")
+  }
+
+  # ---- reconstruction ------------------------------------------------------
+  rc <- config$reconstruction
+  if (!is.null(rc)) {
+    if (!is.list(rc)) {
+      add("`reconstruction` must be a list, or absent.")
+    } else {
+      if (!is.logical(rc$enabled) || length(rc$enabled) != 1 ||
+          is.na(rc$enabled))
+        add("`reconstruction$enabled` must be TRUE or FALSE.")
+
+      if (!is.null(rc$instruments)) {
+        if (!is.character(rc$instruments) || !length(rc$instruments)) {
+          add("`reconstruction$instruments` must be a character vector, or ",
+              "NULL for the site view alone.")
+        } else if (is.list(config$structure$instruments)) {
+          miss <- setdiff(rc$instruments, names(config$structure$instruments))
+          if (length(miss))
+            add("`reconstruction$instruments` names instrument(s) with no ",
+                "`structure$instruments` entry: ", paste(miss, collapse = ", "),
+                ". Available: ",
+                paste(names(config$structure$instruments), collapse = ", "))
+        }
+      }
+
+      bad <- setdiff(rc$formats, c("csv", "rds"))
+      if (!is.character(rc$formats) || !length(rc$formats) || length(bad))
+        add("`reconstruction$formats` must be a non-empty subset of: csv, rds.")
+
+      # Named rather than implemented: the states are reconstructed at the
+      # parameter estimates. Rejecting TRUE here, before a fit starts, is
+      # cheaper than discovering it hours later at the reconstruction step.
+      if (!identical(rc$parameter_uncertainty, FALSE))
+        add("`reconstruction$parameter_uncertainty` must be FALSE: no method ",
+            "for propagating parameter uncertainty is implemented yet.")
+    }
+  }
+
+  if (length(problems))
+    stop("Invalid model configuration (", length(problems), " problem(s)):\n",
+         paste0("  - ", problems, collapse = "\n"), call. = FALSE)
+
+  invisible(config)
+}
+
+
+#' Subset and scale the observations a model will be fit to
+#'
+#' Applies the site and date selection from the config, renumbers the surviving
+#' sites 1..n, locates the rows belonging to each instrument, and scales the
+#' matrix.
+#'
+#' Scaling uses one pair of constants for the whole matrix, taken from a single
+#' reference series, so every series stays on a common scale and the estimated
+#' biases and loadings remain comparable across instruments. Those constants are
+#' saved with the fit so the reconstruction step can return predictions to
+#' degrees C; with scaling disabled they are written as mu = 0, sigma = 1, so
+#' that path does not have to know which was used.
+#'
+#' @param marss_inputs The `marss_inputs.rds` contents from the preprocessing
+#'   step: `ts_matrix`, `harmonics`, `row_var_keys`, `row_site_keys`,
+#'   `row_site_index`, `col_dates`.
+#' @param config The `model_config` list.
+#' @param verbose Print a summary of what was kept.
+#'
+#' @return A list with `y` (the selected observations, unscaled), `y_fit` (what
+#'   is passed to MARSS), `d` (the harmonics on the same time axis), `scales`,
+#'   `dates`, `row_vars`, `row_site`, `row_site_index`, `rows_by_var`,
+#'   `sites_by_var`, `n_site`, `k_obs`, `n_harm` and `observations` (the
+#'   subsetted input, saved for the reconstruction step).
+#' @export
+build_model_data <- function(marss_inputs, config, verbose = TRUE) {
+
+  dat <- marss_inputs
+  need <- c("ts_matrix", "harmonics", "row_var_keys", "row_site_keys",
+            "row_site_index", "col_dates")
+  absent <- setdiff(need, names(dat))
+  if (length(absent))
+    stop("`marss_inputs` is missing: ", paste(absent, collapse = ", "),
+         call. = FALSE)
+
+  # ---- rows: site selection ------------------------------------------------
+  sites <- config$data$sites
+  rows_to_keep <- if (is.null(sites)) rep(TRUE, length(dat$row_site_keys)) else
+    dat$row_site_keys %in% sites
+  if (!any(rows_to_keep))
+    stop("No rows left after selecting sites: ",
+         paste(sites, collapse = ", "), call. = FALSE)
+
+  # ---- columns: date selection ---------------------------------------------
+  col_dates <- as.Date(dat$col_dates)
+  keep_cols <- rep(TRUE, length(col_dates))
+  if (!is.null(config$data$start_date))
+    keep_cols <- keep_cols & col_dates > as.Date(config$data$start_date)
+  if (!is.null(config$data$end_date))
+    keep_cols <- keep_cols & col_dates <= as.Date(config$data$end_date)
+  if (!any(keep_cols))
+    stop("No columns left after applying the date range.", call. = FALSE)
+
+  y <- dat$ts_matrix[rows_to_keep, keep_cols, drop = FALSE]
+  d <- dat$harmonics[, keep_cols, drop = FALSE]
+
+  row_vars       <- dat$row_var_keys[rows_to_keep]
+  row_site       <- dat$row_site_keys[rows_to_keep]
+  row_site_index <- .dense_rank(dat$row_site_index[rows_to_keep])
+
+  n_site <- length(unique(row_site))
+  k_obs  <- nrow(y)
+  n_harm <- nrow(d)
+
+  # ---- rows belonging to each instrument -----------------------------------
+  # Built once here so the Z, a, D and R builders all index the same way; in the
+  # exploratory scripts each rebuilt its own copy.
+  instruments  <- config$structure$instruments
+  rows_by_var  <- list()
+  sites_by_var <- list()
+  for (v in names(instruments)) {
+    r <- which(row_vars == v)
+    if (!length(r)) {
+      warning("No rows for instrument '", v,
+              "' after the site and date selection; it is dropped from the ",
+              "model.", call. = FALSE, immediate. = TRUE)
+      next
+    }
+    rows_by_var[[v]]  <- r
+    sites_by_var[[v]] <- row_site_index[r]
+  }
+  if (!length(rows_by_var))
+    stop("None of the configured instruments have any rows.", call. = FALSE)
+
+  unspoken <- setdiff(unique(row_vars), names(rows_by_var))
+  if (length(unspoken))
+    stop("Rows are present for variable(s) with no `structure$instruments` ",
+         "entry: ", paste(unspoken, collapse = ", "),
+         "\nThey would enter the model with no intercept and no error term.",
+         call. = FALSE)
+
+  # ---- scaling -------------------------------------------------------------
+  # Scaling is per site: each site's observations are put on the scale of one
+  # reference instrument at that site. Every instrument at a site is scaled by
+  # the same pair, so within a site the series stay comparable and the estimated
+  # biases read as departures from the reference; across sites the reference
+  # itself becomes mean 0, variance 1, which is what lets its own intercepts be
+  # fixed at zero rather than estimated.
+  site_levels <- sort(unique(row_site))
+  sc <- config$scaling
+
+  if (isTRUE(sc$enabled)) {
+
+    ref_rows <- which(row_vars == sc$variable)
+    if (!length(ref_rows))
+      stop("No rows for the scaling reference variable '", sc$variable, "'.",
+           call. = FALSE)
+
+    mu <- sigma <- rep(NA_real_, n_site)
+    mu[row_site_index[ref_rows]] <-
+      apply(y[ref_rows, , drop = FALSE], 1, mean, na.rm = TRUE)
+    sigma[row_site_index[ref_rows]] <-
+      apply(y[ref_rows, , drop = FALSE], 1, stats::sd, na.rm = TRUE)
+
+    # A site the reference does not cover, or covers too sparsely, has no scale
+    # to put its other instruments on -- and would silently produce NA rows.
+    bad <- which(!is.finite(mu) | !is.finite(sigma) | sigma <= 0)
+    if (length(bad))
+      stop("The scaling reference '", sc$variable, "' gives no usable mean and ",
+           "standard deviation at: ", paste(site_levels[bad], collapse = ", "),
+           ".\nName a variable that covers every selected site, or drop those ",
+           "sites from `data$sites`.", call. = FALSE)
+
+    scales <- list(mu = mu, sigma = sigma, sites = site_levels,
+                   variable = sc$variable)
+    y_fit  <- (y - mu[row_site_index]) / sigma[row_site_index]
+
+  } else {
+    scales <- list(mu = rep(0, n_site), sigma = rep(1, n_site),
+                   sites = site_levels, variable = NA_character_)
+    y_fit  <- y
+  }
+  rownames(y_fit) <- row_site
+
+  dates <- list(start = min(col_dates[keep_cols]),
+                end   = max(col_dates[keep_cols]),
+                dt    = dat$time_step %||% 1)
+
+  # Everything the reconstruction step needs to map rows back to sites and
+  # instruments, subsetted the same way as `y`.
+  observations <- list(
+    ts_matrix      = y,
+    row_keys       = dat$row_keys[rows_to_keep],
+    row_var_keys   = row_vars,
+    row_site_keys  = row_site,
+    row_site_index = row_site_index,
+    site_levels    = sort(unique(row_site)),
+    col_dates      = col_dates[keep_cols],
+    time_step      = dat$time_step %||% 1
+  )
+
+  if (verbose) {
+    message("Observations: ", k_obs, " rows x ", ncol(y), " columns, ",
+            n_site, " sites, ",
+            format(sum(!is.na(y)), big.mark = ","), " observed cells (",
+            sprintf("%.2f%%", 100 * sum(!is.na(y)) / length(y)), ").")
+    message("  dates:   ", dates$start, " to ", dates$end)
+    message("  rows per instrument: ",
+            paste(sprintf("%s=%d", names(rows_by_var),
+                          lengths(rows_by_var)), collapse = ", "))
+    message("  scaling: ",
+            if (isTRUE(sc$enabled))
+              sprintf("per site from %s, mu %.2f-%.2f, sigma %.2f-%.2f",
+                      scales$variable, min(scales$mu), max(scales$mu),
+                      min(scales$sigma), max(scales$sigma))
+            else "disabled")
+  }
+
+  list(y = y, y_fit = y_fit, d = d, scales = scales, dates = dates,
+       row_vars = row_vars, row_site = row_site,
+       row_site_index = row_site_index,
+       rows_by_var = rows_by_var, sites_by_var = sites_by_var,
+       n_site = n_site, k_obs = k_obs, n_harm = n_harm,
+       observations = observations)
+}
+
+
+#' Build the observation matrix Z
+#'
+#' Under "site_plus_factors" the first `n_site` columns select each row's own
+#' site state, and the remaining `m_factors` columns hold the dynamic factor
+#' loadings. Under "factors_only" the site block is dropped and only the
+#' loadings remain.
+#'
+#' An instrument with `site_state = FALSE` gets zeros in the site block: it
+#' observes the seasonal terms and the shared factors, but not the site's own
+#' anomaly. That is the right structure for an interpolated product such as MUR,
+#' whose value at a site is a smoothed regional field rather than a measurement
+#' of that site -- letting it load on the site state would make it evidence
+#' about an anomaly it cannot actually see.
+#'
+#' The loadings come from `dfa_loadings()` in marss_matrix_functions.R, which
+#' places the triangular zero restrictions that identify the factors. Every
+#' instrument observing a given site shares that site's loading row, so the
+#' factors describe the site rather than the instrument.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @return A list matrix suitable for the `Z` element of a MARSS model list.
+#' @export
+build_observation_matrix <- function(md, config) {
+
+  if (!exists("dfa_loadings"))
+    stop("`dfa_loadings()` not found. Source R/marss_matrix_functions.R first.",
+         call. = FALSE)
+
+  m_factors <- config$structure$m_factors
+
+  Lambda  <- dfa_loadings(md$n_site, m_factors, "lambda")
+  eta_obs <- matrix(list(0), nrow = md$k_obs, ncol = m_factors)
+  for (v in names(md$rows_by_var))
+    eta_obs[md$rows_by_var[[v]], ] <-
+      Lambda[md$sites_by_var[[v]], , drop = FALSE]
+
+  if (identical(config$structure$state_structure, "site_plus_factors")) {
+    I_sites <- matrix(0, nrow = md$n_site, ncol = md$n_site)
+    diag(I_sites) <- 1
+    chi_obs <- I_sites[md$row_site_index, , drop = FALSE]
+
+    # Zeroed in place rather than assembled from row subsets, so the result
+    # does not depend on the instruments happening to be in a particular order
+    # down the matrix.
+    for (v in names(md$rows_by_var))
+      if (!isTRUE(config$structure$instruments[[v]]$site_state))
+        chi_obs[md$rows_by_var[[v]], ] <- 0
+
+    # A site state that nothing loads on is not identified: the model would
+    # estimate its variance and persistence from no observations at all. This
+    # happens as soon as a site's only instrument is one excluded from the site
+    # block, which is easy to arrive at by narrowing `data$sites`.
+    unseen <- which(colSums(chi_obs) == 0)
+    if (length(unseen))
+      stop("No instrument loads on the site state for: ",
+           paste(sort(unique(md$row_site))[unseen], collapse = ", "),
+           ".\nThose states have no observations. Either drop the site from ",
+           "`data$sites`, or set `site_state = TRUE` for an instrument that ",
+           "observes it.", call. = FALSE)
+
+    return(cbind(chi_obs, eta_obs))
+  }
+
+  eta_obs
+}
+
+
+#' Build the observation intercepts a
+#'
+#' One entry per row, named according to the instrument's `intercept` kind:
+#' `mu_<i>` for a shared site mean, `mu_<tag>+mu_<i>` for a site mean plus an
+#' instrument offset (MARSS reads the `+` as a sum of two estimated
+#' parameters), and `mu_<tag>_<i>` for an instrument with its own mean at each
+#' site.
+#'
+#' `"zero"` fixes the intercept at 0 rather than estimating it. That is the
+#' correct choice for the instrument the observations were scaled by: after
+#' per-site scaling its series has mean 0 at every site by construction, so an
+#' estimated intercept would be a free parameter with nothing to explain. Fixing
+#' it also makes every other intercept read as a difference from that reference,
+#' at the site and instrument level.
+#'
+#' Returned as a list rather than a character vector so that fixed and estimated
+#' entries can coexist -- a character matrix would make the fixed `0` a
+#' parameter named "0". MARSS treats an all-character list matrix identically to
+#' a character matrix, so this costs nothing where nothing is fixed.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @return A list of length `k_obs`: numeric entries fixed, character estimated.
+#' @export
+build_observation_intercepts <- function(md, config) {
+
+  n_site <- md$n_site
+  a <- rep(list(0), md$k_obs)
+
+  for (v in names(md$rows_by_var)) {
+    spec <- config$structure$instruments[[v]]
+    if (identical(spec$intercept, "zero")) next   # left fixed at 0
+    nms <- switch(spec$intercept,
+      "site"            = paste0("mu_", seq_len(n_site)),
+      "site+instrument" = paste0("mu_", spec$tag, "+mu_", seq_len(n_site)),
+      "independent"     = paste0("mu_", spec$tag, "_", seq_len(n_site)),
+      stop("Unknown intercept kind for '", v, "': ", spec$intercept,
+           call. = FALSE))
+    a[md$rows_by_var[[v]]] <- as.list(nms[md$sites_by_var[[v]]])
+  }
+
+  a
+}
+
+
+#' Build the seasonal covariate effects D
+#'
+#' One column per harmonic term, one row per observation row. An instrument with
+#' "shared" seasonality uses the site's own coefficients `c<k>_<i>`; one with
+#' "independent" seasonality gets its own set, `c<k>_<tag>_<i>`.
+#'
+#' The number of harmonic terms is taken from the covariate matrix rather than
+#' assumed, so changing `harmonics` in the preprocessing config carries through
+#' without touching this code.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @return A character matrix, `k_obs` by `n_harm`.
+#' @export
+build_covariate_effects <- function(md, config) {
+
+  n_site <- md$n_site
+  n_harm <- md$n_harm
+  D <- matrix(0, nrow = md$k_obs, ncol = n_harm)
+
+  for (v in names(md$rows_by_var)) {
+    spec   <- config$structure$instruments[[v]]
+    infix  <- switch(spec$seasonality,
+      "shared"      = "",
+      "independent" = paste0(spec$tag, "_"),
+      stop("Unknown seasonality kind for '", v, "': ", spec$seasonality,
+           call. = FALSE))
+
+    # n_site x n_harm: rows are sites, columns are harmonic terms.
+    nms <- vapply(seq_len(n_harm),
+                  function(k) paste0("c", k, "_", infix, seq_len(n_site)),
+                  character(n_site))
+
+    D[md$rows_by_var[[v]], ] <- nms[md$sites_by_var[[v]], , drop = FALSE]
+  }
+
+  D
+}
+
+
+#' Build the observation covariance R
+#'
+#' Each instrument gets its own variance on the diagonal. An instrument with
+#' `day_effect = TRUE` additionally gets a single covariance, `cov_<tag>`,
+#' between every pair of its own rows: a cloud or a wind event affects a whole
+#' scene at once, so on any given day that instrument's errors are shifted
+#' together across sites rather than independently.
+#'
+#' A day effect can only be estimated by the EM algorithm. The direct
+#' optimisers require every block of a variance-covariance matrix to be fixed,
+#' diagonal, or wholly unconstrained, and a diagonal of per instrument
+#' variances with one shared off-diagonal covariance is none of those.
+#' `validate_model_config()` rejects that combination before a run starts.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @return A `k_obs` by `k_obs` list matrix.
+#' @export
+build_observation_covariance <- function(md, config) {
+
+  R <- matrix(list(0), nrow = md$k_obs, ncol = md$k_obs)
+
+  for (v in names(md$rows_by_var)) {
+    spec <- config$structure$instruments[[v]]
+    diag(R)[md$rows_by_var[[v]]] <- spec$error
+  }
+
+  for (v in names(md$rows_by_var)) {
+    spec <- config$structure$instruments[[v]]
+    if (!isTRUE(spec$day_effect)) next
+    nm   <- paste0("cov_", spec$tag)
+    rows <- md$rows_by_var[[v]]
+    for (i in rows) for (j in rows) if (i != j) R[[i, j]] <- nm
+  }
+
+  R
+}
+
+
+#' Build the state model: B, Q, U, x0 and V0
+#'
+#' Under "site_plus_factors" the states are the `n_site` site level anomalies
+#' followed by the `m_factors` shared factors. The site states share one
+#' autocorrelation, `rho_chi`, and one innovation variance, `tau_1`; the factors
+#' share `rho_eta` and have their variance fixed at 1, which together with the
+#' triangular loadings identifies the factor scale.
+#'
+#' Under "factors_only" only the factors remain, with autocorrelation `rho` and
+#' an estimated innovation variance `tau`. Freeing that variance removes the
+#' scale identification, so the individual loadings from such a fit are not
+#' interpretable on their own even though the states and fitted values are.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @return A list with `B`, `Q`, `U`, `x0`, `V0` and `n_total`.
+#' @export
+build_state_model <- function(md, config) {
+
+  n_eta <- config$structure$m_factors
+
+  if (identical(config$structure$state_structure, "site_plus_factors")) {
+
+    n_chi   <- md$n_site
+    n_total <- n_chi + n_eta
+
+    B <- matrix(list(0), nrow = n_total, ncol = n_total)
+    diag(B)[seq_len(n_chi)]                <- rep("rho_chi", n_chi)
+    diag(B)[n_chi + seq_len(n_eta)]        <- rep("rho_eta", n_eta)
+
+    Q <- matrix(list(0), nrow = n_total, ncol = n_total)
+    diag(Q)[seq_len(n_chi)]                <- rep("tau_1", n_chi)
+    diag(Q)[n_chi + seq_len(n_eta)]        <- rep(list(1), n_eta)
+
+  } else {
+
+    n_total <- n_eta
+
+    B <- matrix(list(0), nrow = n_total, ncol = n_total)
+    diag(B)[seq_len(n_total)] <- rep("rho", n_total)
+
+    Q <- matrix(list(0), nrow = n_total, ncol = n_total)
+    diag(Q)[seq_len(n_total)] <- rep("tau", n_total)
+  }
+
+  # Hold B at stated values, for a method that cannot estimate it. Applied as a
+  # post-pass over whatever names the structure produced, so it works for
+  # rho_chi/rho_eta and for rho without branching on the structure again.
+  #
+  # Fixing B numerically rather than leaving it free and hoping the optimiser
+  # moves it matters: TMB leaves a free B at its starting value and still
+  # reports it as an estimated parameter. Fixed, it correctly disappears from
+  # the parameter set, so what was and was not estimated is legible from the fit.
+  B_fixed <- config$structure$B_fixed
+  if (!is.null(B_fixed)) {
+    for (i in seq_len(n_total)) {
+      nm <- B[[i, i]]
+      if (is.character(nm)) B[[i, i]] <- unname(B_fixed[[nm]])
+    }
+  }
+
+  U  <- rep(list(0), n_total)
+  x0 <- rep(list(0), n_total)
+  V0 <- matrix(list(0), nrow = n_total, ncol = n_total)
+  diag(V0) <- config$structure$init_var_x0
+
+  list(B = B, Q = Q, U = U, x0 = x0, V0 = V0, n_total = n_total)
+}
+
+
+#' Assemble the full MARSS model list
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @return The list passed as the `model` argument of `MARSS()`.
+#' @export
+build_marss_model <- function(md, config) {
+
+  state <- build_state_model(md, config)
+
+  list(
+    Z  = build_observation_matrix(md, config),
+    A  = matrix(build_observation_intercepts(md, config), ncol = 1),
+    R  = build_observation_covariance(md, config),
+    B  = state$B,
+    U  = matrix(state$U, ncol = 1),
+    Q  = state$Q,
+    D  = build_covariate_effects(md, config),
+    x0 = matrix(state$x0, ncol = 1),
+    V0 = state$V0,
+    d  = md$d
+  )
+}
+
+
+#' Least squares starting values for one instrument's mean and seasonality
+#'
+#' The EM algorithm starts every parameter at zero, leaving it to discover the
+#' annual cycle -- by far the largest signal in the data -- one iteration at a
+#' time. Regressing an instrument's series on the harmonics gives a starting
+#' point that removes that phase of the run.
+#'
+#' The regression is run on the scaled matrix that is actually fitted, so the
+#' coefficients are on the same scale as the parameters they seed. Sites with
+#' fewer than `inits$min_obs` observations, or whose fit is rank deficient, are
+#' left at the default start.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @param variable The instrument whose rows the regression is fit to.
+#' @return A data frame with one row per site and columns `site`, `mu` and
+#'   `c1`..`c<n_harm>`; `NA` where a site could not be fit.
+#' @export
+seasonal_inits <- function(md, config, variable) {
+
+  n_harm <- md$n_harm
+  rows   <- md$rows_by_var[[variable]]
+  if (is.null(rows))
+    stop("'", variable, "' has no rows in the selected data.", call. = FALSE)
+
+  out <- data.frame(site = seq_len(md$n_site), mu = NA_real_)
+  for (k in seq_len(n_harm)) out[[paste0("c", k)]] <- NA_real_
+
+  for (r in rows) {
+    s  <- md$row_site_index[r]
+    yy <- md$y_fit[r, ]
+    ok <- !is.na(yy)
+    if (sum(ok) < config$inits$min_obs) next
+
+    X   <- t(md$d[, ok, drop = FALSE])
+    cf  <- stats::coef(stats::lm(yy[ok] ~ X))
+    # A rank deficient fit drops terms and returns NA coefficients; seeding from
+    # it would put NA into the parameter vector and stop the run.
+    if (length(cf) == n_harm + 1L && all(is.finite(cf)))
+      out[s, 2:(2 + n_harm)] <- cf
+  }
+
+  out
+}
+
+
+#' Collect starting values for every parameter the warm start can seed
+#'
+#' Two things are seeded, and they are kept separate because they are different
+#' parameters.
+#'
+#' The shared site terms, `mu_<i>` and `c<k>_<i>`, come from a single
+#' instrument named by `inits$shared_from`. Any instrument may be named; the
+#' question is only which series is the best available description of the
+#' site's own seasonal cycle. A gap free product covering every site is usually
+#' a better starting point than an exact record covering two of them, even
+#' though it is a proxy, since this only sets where the optimiser begins.
+#'
+#' Instruments with their own mean or seasonality -- `mu_<tag>_<i>`,
+#' `c<k>_<tag>_<i>` -- are seeded from their own rows when
+#' `inits$seed_independent` is TRUE. Those parameters otherwise start at zero,
+#' which for an instrument with an independent seasonal cycle means starting
+#' with no seasonal cycle at all.
+#'
+#' An instrument whose intercept is "site+instrument" contributes nothing here:
+#' its offset `mu_<tag>` is a separate parameter, and the site part of its mean
+#' is already covered by the shared terms.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @param verbose Report where each group of starting values came from.
+#'
+#' @return A named numeric vector of parameter names to starting values, using
+#'   the model's own names without a MARSS matrix prefix.
+#' @export
+build_inits_seeds <- function(md, config, verbose = TRUE) {
+
+  seeds  <- numeric(0)
+  n_harm <- md$n_harm
+  terms  <- c("mu", paste0("c", seq_len(n_harm)))
+
+  collect <- function(pars, name_for) {
+    got <- numeric(0)
+    for (i in seq_len(md$n_site)) {
+      for (nm in terms) {
+        value <- pars[[nm]][i]
+        key   <- name_for(nm, i)
+        if (is.null(key) || is.null(value) || !is.finite(value)) next
+        got[key] <- value
+      }
+    }
+    got
+  }
+
+  # ---- shared site terms ---------------------------------------------------
+  shared <- config$inits$shared_from
+  pars   <- seasonal_inits(md, config, shared)
+  got    <- collect(pars, function(nm, i) paste0(nm, "_", i))
+  seeds  <- c(seeds, got)
+  if (verbose)
+    message("  shared site terms: ", length(got), " from ", shared,
+            " (", sum(!is.na(pars$mu)), " of ", md$n_site, " sites).")
+
+  # ---- instrument specific terms -------------------------------------------
+  if (isTRUE(config$inits$seed_independent)) {
+    for (v in names(md$rows_by_var)) {
+      spec <- config$structure$instruments[[v]]
+      own_mu   <- identical(spec$intercept, "independent")
+      own_seas <- identical(spec$seasonality, "independent")
+      if (!own_mu && !own_seas) next
+
+      pars <- seasonal_inits(md, config, v)
+      got  <- collect(pars, function(nm, i) {
+        if (nm == "mu" && !own_mu)  return(NULL)
+        if (nm != "mu" && !own_seas) return(NULL)
+        paste0(nm, "_", spec$tag, "_", i)
+      })
+      seeds <- c(seeds, got)
+      if (verbose)
+        message("  ", v, " own terms: ", length(got), " from its own rows (",
+                sum(!is.na(pars$mu)), " of ", md$n_site, " sites).")
+    }
+  }
+
+  seeds
+}
+
+
+#' Seed a fitted MARSS object's parameter vector with starting values
+#'
+#' `MARSSvectorizeparam()` is used to recover the parameter names and their
+#' ordering from a throwaway fit, the named entries are overwritten, and the
+#' vector is converted back into an inits list.
+#'
+#' MARSS folds the covariate term `D d` into the observation intercept when it
+#' converts to its internal form, so a seasonal coefficient may be named either
+#' `A.c1_1` or `D.c1_1` depending on the version and the model. Both are tried,
+#' rather than assuming one.
+#'
+#' @param fit A fitted `marssMLE`, typically from a two iteration warm up run.
+#' @param seeds Named numeric vector from `build_inits_seeds()`.
+#' @param verbose Report how many parameters were seeded.
+#'
+#' @return A `marssMLE` whose parameters carry the starting values.
+#' @export
+apply_inits <- function(fit, seeds, verbose = TRUE) {
+
+  init_vec <- MARSSvectorizeparam(fit)
+  seeded   <- 0L
+
+  for (nm in names(seeds)) {
+    # Whichever form MARSS gave the parameter, seed it there.
+    keys <- paste0(c("A.", "D."), nm)
+    key  <- keys[keys %in% names(init_vec)]
+    if (!length(key)) next
+    init_vec[key[1]] <- seeds[[nm]]
+    seeded <- seeded + 1L
+  }
+
+  if (verbose)
+    message("Warm start: seeded ", seeded, " of ", length(seeds),
+            " starting values into the parameter vector.")
+  if (length(seeds) > 0 && seeded == 0)
+    warning("No starting values matched a parameter name, so the fit begins ",
+            "from the MARSS defaults.", call. = FALSE, immediate. = TRUE)
+
+  MARSSvectorizeparam(fit, init_vec)
+}
+
+
+#' Carry parameter estimates from one fit to another by name
+#'
+#' The initialisation stage fits a different model from the one that follows --
+#' B is held fixed and the day effects are dropped -- so its estimates cannot be
+#' copied across by position. They are matched on the parameter names MARSS
+#' itself uses (`A.mu_1`, `R.sigma_2_lst`, `Z.lambda_1_1`, ...). Anything the
+#' first stage did not estimate simply has no name to match and keeps the
+#' second stage's own starting value.
+#'
+#' This is deliberately distinct from `apply_inits()`, which takes unprefixed
+#' names from the least squares warm start and has to guess between the `A.` and
+#' `D.` forms. Here both sides are full MARSS names and must match exactly.
+#'
+#' @param from_fit The fit supplying estimates.
+#' @param to_fit A fit of the target model, used for its parameter ordering.
+#' @param verbose Report how many parameters carried over.
+#'
+#' @return A `marssMLE` for the target model carrying the transferred values.
+#' @export
+transfer_params <- function(from_fit, to_fit, verbose = TRUE) {
+
+  src <- MARSSvectorizeparam(from_fit)
+  dst <- MARSSvectorizeparam(to_fit)
+
+  common <- intersect(names(src), names(dst))
+  kept   <- setdiff(names(dst), names(src))
+
+  dst[common] <- src[common]
+
+  if (verbose) {
+    message("Transferred ", length(common), " of ", length(dst),
+            " parameters from the initialisation fit.")
+    if (length(kept))
+      message("  left at defaults (not estimable in that stage): ",
+              paste(kept, collapse = ", "))
+  }
+  if (!length(common))
+    warning("No parameter names matched between the two stages, so the ",
+            "initialisation fit contributed nothing.",
+            call. = FALSE, immediate. = TRUE)
+
+  MARSSvectorizeparam(to_fit, dst)
+}
+
+
+#' Fit the model, optionally through a fast initialisation stage first
+#'
+#' The final fit is run as repeated short calls rather than one long one. Each
+#' chunk is saved as it completes, so a run that is interrupted -- or that is
+#' still climbing after days of EM iterations -- leaves a usable fit behind, and
+#' the log likelihood trace shows whether it is still improving. It stops as
+#' soon as MARSS reports convergence.
+#'
+#' Chunking is an EM idiom. The direct optimisers reach their own stopping rule
+#' inside one call, so with `method` other than "kem" a run normally finishes at
+#' the first chunk and `chunks` is never reached.
+#'
+#' When `fitting$init$enabled` is TRUE the run has two stages. The first fits a
+#' reduced model -- B held at `init$B_values`, day effects dropped -- with a fast
+#' method, typically TMB. Neither restriction is a compromise on the result: the
+#' stage exists only to supply starting values, and the parameters it cannot
+#' estimate are the ones not transferred. The second stage then fits the model
+#' the config actually describes, starting from those values.
+#'
+#' The throwaway fit used to recover a parameter ordering always runs under EM,
+#' whichever method the real fit uses: the ordering is a property of the model,
+#' not of the optimiser, and EM will produce it for any model the config can
+#' express.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param model_list Output of `build_marss_model()` for the full model.
+#' @param config The `model_config` list.
+#' @param outdir Directory to write the fits and `loglik.csv` into.
+#' @param verbose Print progress.
+#'
+#' @return A list with the final `fit`, the `trace` data frame, and `init_fit`
+#'   (NULL when no initialisation stage ran).
+#' @export
+fit_marss <- function(md, model_list, config, outdir, verbose = TRUE) {
+
+  y        <- md$y_fit
+  method   <- config$fitting$method %||% "kem"
+  controls <- config$fitting$controls[[method]]
+  init_cfg <- config$fitting$init
+
+  trace <- data.frame(stage = character(), method = character(),
+                      chunk = integer(), iterations = integer(),
+                      logLik = numeric(), convergence = integer())
+
+  # Rewritten after every fit, so an interrupted run still has its trace.
+  record <- function(trace, stage, method, chunk, fit) {
+    # The direct optimisers do not report an iteration count the way EM does.
+    iters <- if (is.null(fit$numIter)) NA_integer_ else as.integer(fit$numIter)
+    trace <- rbind(trace, data.frame(
+      stage = stage, method = method, chunk = chunk, iterations = iters,
+      logLik = fit$logLik, convergence = fit$convergence))
+    utils::write.csv(trace, file.path(outdir, "loglik.csv"), row.names = FALSE)
+    message(sprintf("%-5s | chunk %2s | iters %5s | logLik %.3f",
+                    stage, chunk, if (is.na(iters)) "-" else iters, fit$logLik))
+    trace
+  }
+
+  # ---- least squares warm start --------------------------------------------
+  # Feeds whichever fit runs first. Starting the seasonal terms at zero is
+  # expensive for every method, not just EM.
+  seeds <- NULL
+  if (isTRUE(config$inits$enabled)) {
+    if (verbose) message("Fitting warm start regressions ...")
+    seeds <- build_inits_seeds(md, config, verbose = verbose)
+  }
+
+  ordering_fit <- function(mod) {
+    MARSS(y, mod, method = "kem", control = config$fitting$warmup_controls)
+  }
+
+  # ---- stage 1: initialisation ---------------------------------------------
+  init_fit <- NULL
+  if (isTRUE(init_cfg$enabled)) {
+
+    icfg  <- .init_config(config)
+    imod  <- build_marss_model(md, icfg)
+    imeth <- icfg$fitting$method
+
+    if (verbose) {
+      dropped <- .day_effect_vars(config)
+      message("Stage 1: ", imeth, ", B fixed at ",
+              paste(sprintf("%s=%s", names(icfg$structure$B_fixed),
+                            icfg$structure$B_fixed), collapse = ", "),
+              if (length(dropped))
+                paste0(", day effects dropped (",
+                       paste(dropped, collapse = ", "), ")") else "", ".")
+    }
+
+    iinits <- NULL
+    if (!is.null(seeds)) {
+      if (verbose) message("Recovering the parameter ordering ...")
+      iinits <- stats::coef(apply_inits(ordering_fit(imod), seeds,
+                                        verbose = verbose), type = "list")
+    }
+
+    iargs <- list(y = y, model = imod, method = imeth,
+                  control = icfg$fitting$controls[[imeth]])
+    if (!is.null(iinits)) iargs$inits <- iinits
+
+    init_fit <- do.call(MARSS, iargs)
+    saveRDS(init_fit, file.path(outdir, "fit_init.rds"))
+    trace <- record(trace, "init", imeth, NA_integer_, init_fit)
+  }
+
+  # ---- stage 2: the model the config describes -----------------------------
+  if (verbose) message("Stage 2: ", method, ".")
+
+  inits <- NULL
+  if (!is.null(init_fit)) {
+    # The ordering fit gives the full model's parameter layout; the values then
+    # come from stage 1 wherever the names line up.
+    inits <- stats::coef(
+      transfer_params(init_fit, ordering_fit(model_list), verbose = verbose),
+      type = "list")
+  } else if (!is.null(seeds)) {
+    if (verbose) message("Recovering the parameter ordering ...")
+    inits <- stats::coef(apply_inits(ordering_fit(model_list), seeds,
+                                     verbose = verbose), type = "list")
+  }
+
+  fit <- NULL
+  for (chunk in seq_len(config$fitting$chunks)) {
+
+    args <- list(y = y, model = model_list, method = method,
+                 control = controls)
+    start <- if (is.null(fit)) inits else stats::coef(fit, type = "list")
+    if (!is.null(start)) args$inits <- start
+
+    fit <- do.call(MARSS, args)
+
+    saveRDS(fit, file.path(outdir, sprintf("fit_chunk_%02d.rds", chunk)))
+    trace <- record(trace, "fit", method, chunk, fit)
+
+    if (isTRUE(fit$convergence == 0)) {
+      message("Converged after ", chunk, " chunk(s).")
+      break
+    }
+  }
+
+  if (!isTRUE(fit$convergence == 0))
+    message("Stopped at the chunk limit (", config$fitting$chunks,
+            ") without convergence; raise `fitting$chunks` to continue.")
+
+  list(fit = fit, trace = trace, init_fit = init_fit)
+}
+
+
+#' Describe the model a fit was produced by
+#'
+#' The dimensions and parameterisation choices the reconstruction step needs to
+#' interpret a fit, and the record of how it was fitted.
+#'
+#' `instruments` and `reconstruction` are the *resolved* config values rather
+#' than a pointer at config_used.R, which matters because run_model.R copies the
+#' config file before applying the command line overrides: a run launched with
+#' --structure or --m-factors is not described by the file sitting next to it,
+#' but is described by this.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @return The design list, as written to design.rds.
+#' @export
+build_design <- function(md, config) {
+
+  init <- config$fitting$init
+
+  list(n_site          = md$n_site,
+       m_factors       = config$structure$m_factors,
+       state_structure = config$structure$state_structure,
+       n_harmonics     = md$n_harm,
+       instruments     = config$structure$instruments,
+       reconstruction  = config$reconstruction,
+       method          = config$fitting$method %||% "kem",
+       day_effects     = .day_effect_vars(config),
+       init_method     = if (isTRUE(init$enabled)) init$method else NA_character_,
+       init_B_values   = if (isTRUE(init$enabled))
+         .resolve_b_values(.b_param_names(config), init$B_values)
+         else NULL)
+}
+
+
+#' Write the fixed record of a fit
+#'
+#' These four objects are the contract with the reconstruction step in
+#' 03_reconstruct_states.R: the observation matrix and its row keys, the
+#' scaling constants needed to return predictions to degrees C, the date range
+#' the columns span, and the model dimensions.
+#'
+#' @param md Output of `build_model_data()`.
+#' @param config The `model_config` list.
+#' @param outdir Directory to write into.
+#' @param verbose Print what was written.
+#' @return The paths written, invisibly.
+#' @export
+write_model_outputs <- function(md, config, outdir, verbose = TRUE) {
+
+  design <- build_design(md, config)
+
+  paths <- c(observations = file.path(outdir, "observations.rds"),
+             scales       = file.path(outdir, "scales.rds"),
+             dates        = file.path(outdir, "dates.rds"),
+             design       = file.path(outdir, "design.rds"))
+
+  saveRDS(md$observations, paths[["observations"]])
+  saveRDS(md$scales,       paths[["scales"]])
+  saveRDS(md$dates,        paths[["dates"]])
+  saveRDS(design,          paths[["design"]])
+
+  if (verbose)
+    message("Wrote observations.rds, scales.rds, dates.rds and design.rds.")
+
+  invisible(paths)
+}
