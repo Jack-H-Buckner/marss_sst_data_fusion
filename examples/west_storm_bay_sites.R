@@ -46,7 +46,7 @@
 ### the runs already in models/.
 ############################################################
 input      <- "outputs/tasi_salmon_20_yrs_2026-08-29/marss_inputs.rds"
-sites      <- c("CB002", "SF039", "SF043", "SF036", "SF041","SF040")
+sites      <- c("CB001", "CB004", "SF001", "SF013", "SF007","SF025","SF008")
 start_date <- "2006-01-01"
 end_date   <- NULL
 
@@ -112,7 +112,7 @@ scaling_params <- list(enabled = enabled, variable = variable)
 ### identification note in R/marss_matrix_functions.R.
 ############################################################
 state_structure <- "site_plus_factors"
-m_factors       <- 2
+m_factors       <- 3
 
 
 ############################################################
@@ -183,10 +183,10 @@ instruments <- list(
     error = "sigma_2_insitu", day_effect = FALSE, site_state = TRUE),
   lst_sst_clean = list(
     tag = "lst", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_lst", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_lst", day_effect = FALSE, site_state = TRUE),
   eco_sst_v002_clean = list(
     tag = "eco", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_eco", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_eco", day_effect = FALSE, site_state = TRUE),
   modis_sst = list(
     tag = "modis", intercept = "site", seasonality = "shared",
     error = "sigma_2_modis", day_effect = FALSE, site_state = TRUE),
@@ -290,7 +290,7 @@ inits_params <- list(
 ### real fit uses, since the ordering is a property of the
 ### model rather than of the optimiser.
 ############################################################
-method <- "kem"
+method <- "BFGS"
 
 controls <- list(
   
@@ -448,7 +448,7 @@ reconstruction_params <- list(
 ### The command line flags --outdir and --run-name override
 ### these values.
 ############################################################
-output_root <- "examples/macquarie_harbor"
+output_root <- "examples/models/west_storm_bay"
 run_name    <- NULL
 
 output_params <- list(output_root = output_root, run_name = run_name)
