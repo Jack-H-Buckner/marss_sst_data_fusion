@@ -146,12 +146,12 @@ obs <- convert_long_format_marss(clean, time_step = 1,
 The second step fits the MARSS model to the observation matrix the preprocessing step
 wrote. Every choice that used to be hard coded in a script — which sites, which dates,
 which instruments share a mean or a seasonal cycle, how the states are structured — is a
-value in `parameters/model.R`, so a fit is fully described by its config file.
+value in `parameters/example_model.R`, so a fit is fully described by its config file.
 
 ### Running it
 
 ```
-Rscript R/run_model.R --config parameters/model.R
+Rscript R/run_model.R --config parameters/example_model.R
 ```
 
 Like the preprocessing script it finds the project root from its own location, so it can
@@ -162,7 +162,7 @@ directly:
 source("R/marss_matrix_functions.R")
 source("R/02_model_specification.R")
 
-cfg <- read_model_config("parameters/model.R")
+cfg <- read_model_config("parameters/example_model.R")
 dat <- readRDS(cfg$data$input)
 validate_model_config(cfg, dat)
 
@@ -183,7 +183,7 @@ Two state structures are available, selected by `structure$state_structure`:
 | `site_plus_factors` | one AR(1) per site, plus `m_factors` shared dynamic factors | fixed at 1, which identifies the factor scale |
 | `factors_only` | the shared factors alone | estimated, so the loadings are no longer separately identified |
 
-`parameters/model.R` and `parameters/model_seasonal_diffs.R` are the same configuration
+`parameters/example_model.R` and `parameters/model_seasonal_diffs.R` are the same configuration
 under the two structures.
 
 Each instrument's place in the observation model is one entry in
@@ -268,31 +268,94 @@ transferred by name:                     68
 left at defaults:  R.cov_lst, R.cov_eco, B.rho_chi, B.rho_eta
 ```
 
-Those four are exactly the parameters stage 1 is structurally unable to estimate, which is
-what makes dropping them safe here and not for the final fit.
+Those are exactly the parameters stage 1 is structurally unable to estimate, which is what
+makes dropping them safe here and not for the final fit.
 
-`init$B_values` is a single number applied to every free entry of `B`, or a named list for
-per-block control:
+### Where B starts
+
+`init$B_values` governs **both** stages: stage 1 holds `B` fixed there, and the final fit,
+where `B` is free again, starts from it — whichever method that fit uses.
+
+That second part matters. `B` is the one parameter nothing else sets: stage 1 holds it at a
+fixed value, so it is not a parameter there and has no name to transfer, and the warm start
+seeds only the seasonal terms. Left alone, the final fit would begin `B` wherever the
+throwaway ordering fit happened to leave it after two EM iterations from MARSS's own
+default of 1 — a random walk, and a starting point that shifts whenever `warmup_controls`
+is touched. Under TMB, which does not estimate `B`, that arbitrary value is not just the
+starting point but the reported answer.
+
+It is a single number applied to every free entry of `B`, or a named list for per-block
+control:
 
 ```r
-B_values <- 0.9                              # every free entry
-B_values <- list(rho_chi = 0.9, rho_eta = 0.95)   # site and factor blocks
+B_values <- 0.975                                    # every free entry
+B_values <- list(rho_chi = 0.975, rho_eta = 0.99)    # site and factor blocks
 ```
 
-0.9 is strongly persistent day to day but stationary, so stage 1's states stay well
-behaved. Because TMB holds `B` at whatever it is given, this is a modelling choice rather
-than a tuning knob. Pass `--no-init` to skip the stage entirely, or `--init-method` /
-`--init-B` to override it.
+0.975 is strongly persistent yet stationary: near-shore temperature anomalies decay on the
+scale of weeks rather than days, and a value near 1 reflects that without letting the
+states wander as a random walk would. Because TMB holds `B` at whatever it is given, this
+is a modelling choice rather than a tuning knob.
+
+Pass `--no-init` to skip the initialisation stage entirely — `B` still starts at
+`init$B_values` — or `--init-method` / `--init-B` to override it.
 
 Note that `--no-init` (skip the initialisation stage) and `--no-warm-start` (skip the
 least-squares seeding of the seasonal terms) are different things; the warm start feeds
 whichever fit runs first.
 
+### Restarting a run from a saved fit
+
+A run directory keeps every stage of its fit, so neither stage has to be paid for twice.
+
+```
+# skip stage 1, hand its estimates to a different final optimiser
+Rscript R/run_model.R --run-name v3_kem --method kem --init-from models/v2_bfgs
+
+# continue a run that stopped at the chunk limit while still climbing
+Rscript R/run_model.R --run-name v2_kem_more --resume-from models/v2_kem
+
+# hand a converged BFGS fit to EM so the day effects can be estimated
+Rscript R/run_model.R --run-name v3_kem_day --method kem \
+  --resume-from models/v2_bfgs/fit_chunk_01.rds
+```
+
+`--init-from` replaces the initialisation stage with one already on disk. This is safe
+across final methods because **stage 1 does not depend on one**: it always holds `B`
+fixed, always drops the day effects, and always uses `init$method`, whatever `method`
+says. A saved stage 1 is reusable as long as `data`, `scaling`, `structure` and
+`fitting$init` are unchanged.
+
+`--resume-from` starts the final fit from a saved one. Either flag accepts a run
+directory — resolving to `fit_init.rds` or to the highest-numbered `fit_chunk_NN.rds` —
+or a path to the fit itself. Only one of the two may be given.
+
+Both transfer estimates **by parameter name**, the same mechanism the two-stage fit uses,
+so the model being fit does not have to be the one that produced them. The case worth
+understanding is the third example: a fit produced under BFGS had to have the day effects
+dropped, and continuing it under EM with them on is the natural next step. Those two
+covariances have no counterpart in the saved fit, so they are left at their defaults and
+reported as such:
+
+```
+resume | chunk NA | iters    78 | logLik 19291.724
+Stage 2: kem.
+Transferred 65 of 67 parameters from the resumed fit.
+  left at defaults (not estimable in that stage): R.cov_lst, R.cov_eco
+fit   | chunk  1 | iters     3 | logLik 19302.032
+```
+
+The loaded fit is copied into the new run directory (as `fit_init.rds` or
+`fit_resumed.rds`) and recorded in `loglik.csv` as an `init` or `resume` row, so the new
+directory stays self-contained and the trace shows the log likelihood the run started
+from. A run refuses to start if the saved fit was fit to different observations — the
+parameter names would still match, so the transfer would otherwise be silently wrong.
+
 ### Options
 
 | Flag | Meaning |
 |---|---|
-| `--config PATH` | Config file. Default `parameters/model.R` |
+| `--config PATH` | Config file. Default `parameters/example_model.R` |
 | `--input PATH` | `marss_inputs.rds`, or the preprocessing run directory holding it |
 | `--outdir PATH` | Output directory, used verbatim. Overrides everything below |
 | `--run-name NAME` | Run subdirectory name. Overrides the config's `run_name` |
@@ -306,8 +369,10 @@ whichever fit runs first.
 | `--maxit N` | Iterations per chunk, for the selected method |
 | `--no-scaling` | Fit in degrees C rather than scaling the observations |
 | `--init-method NAME` | Method for the initialisation stage. Default `TMB` |
-| `--init-B VALUE` | Value `B` is held at during initialisation. Default `0.9` |
+| `--init-B VALUE` | Value `B` is held at during initialisation, and where the final fit starts it. Default `0.975` |
 | `--no-init` | Skip the initialisation stage and fit directly |
+| `--init-from PATH` | Start from a saved initialisation fit: a run directory, or a `fit_init.rds` |
+| `--resume-from PATH` | Start the final fit from a saved one: a run directory, or a `fit_chunk_NN.rds` |
 | `--no-warm-start` | Skip the least squares seeding of the seasonal terms |
 | `--no-figures` | Skip the coverage figure |
 | `--overwrite` | Allow writing into a non-empty output directory |

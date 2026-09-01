@@ -127,6 +127,71 @@ library(MARSS)
   cfg
 }
 
+# Locate a saved fit to start from. `path` is either a run directory or the fit
+# itself; a directory resolves to its last chunk or to fit_init.rds, depending
+# on which stage the caller is replacing.
+#
+# read_run_dir() in 03_reconstruct_states.R carries the same chunk selection.
+# That duplication is deliberate: 03 has no hard dependency on this file -- its
+# one use of read_model_config() is guarded by exists() -- so that it can be
+# sourced on its own, and sharing four lines is not worth a source order
+# dependency between them.
+.resolve_fit_path <- function(path, prefer = c("chunk", "init")) {
+
+  prefer <- match.arg(prefer)
+
+  if (!dir.exists(path)) {
+    if (!file.exists(path))
+      stop("No fit found at: ", path, call. = FALSE)
+    return(path)
+  }
+
+  name <- if (identical(prefer, "init")) "fit_init.rds" else {
+    chunks <- sort(list.files(path, pattern = "^fit_chunk_[0-9]+\\.rds$"))
+    if (length(chunks)) chunks[length(chunks)] else "fit_init.rds"
+  }
+
+  out <- file.path(path, name)
+  if (!file.exists(out))
+    stop("Run directory holds no ", name, ": ", path,
+         "\nName the fit directly if it is somewhere else.", call. = FALSE)
+  out
+}
+
+# Refuse to start from a fit of different data.
+#
+# transfer_params() matches on parameter names, and the names are a property of
+# the model rather than of the data: a fit of a different site set, date range or
+# scaling produces exactly the same names, transfers cleanly, and is silently
+# wrong. Nothing downstream would notice, so it is caught here.
+#
+# The comparison is on values rather than row names because MARSS de-duplicates
+# the site keys build_model_data() puts on y_fit into CB001-1, CB008-1,
+# CB001-2 ...; undoing that needs a suffix strip that a site key ending in a
+# digit would break. Comparing the matrices catches a changed site set, date
+# range, instrument set or scaling in one check.
+.check_same_data <- function(loaded, y, what) {
+
+  d_old <- dim(loaded$model$data)
+  d_new <- dim(y)
+
+  if (!identical(d_old, d_new))
+    stop(what, " was fit to a ", d_old[1], " x ", d_old[2],
+         " observation matrix, but this run's is ", d_new[1], " x ", d_new[2],
+         ".\nThe two describe different data, so its estimates cannot be ",
+         "carried across. Match `data$sites` and the date range to the run ",
+         "you are starting from.", call. = FALSE)
+
+  same <- isTRUE(all.equal(unname(loaded$model$data), unname(y)))
+  if (!same)
+    stop(what, " was fit to observations that differ from this run's, though ",
+         "they are the same shape.\nThe site or date selection matches but the ",
+         "values do not -- check `scaling` and the instrument set against the ",
+         "run you are starting from.", call. = FALSE)
+
+  invisible(TRUE)
+}
+
 
 #' Read a model configuration
 #'
@@ -385,8 +450,27 @@ validate_model_config <- function(config, marss_inputs = NULL) {
     }
 
     # ---- fitting$init ------------------------------------------------------
+    # ---- starting from a fit already on disk --------------------------------
+    for (k in c("resume_from", "init$from")) {
+      v <- if (identical(k, "resume_from")) ft$resume_from else ft$init$from
+      if (!is.null(v) && (!is.character(v) || length(v) != 1 || !nzchar(v)))
+        add("`fitting$", k, "` must be a single path, or NULL.")
+    }
+    if (!is.null(ft$resume_from) && !is.null(ft$init$from))
+      add("`fitting$init$from` and `fitting$resume_from` both name a fit to ",
+          "start from. Set one: `init$from` replaces the initialisation stage, ",
+          "`resume_from` continues a final fit.")
+
     it <- ft$init
     if (!is.null(it)) {
+      # Supplying an initialisation fit and switching the stage off are
+      # contradictory instructions, and quietly honouring one of them would mean
+      # the run silently ignores the fit it was pointed at.
+      if (is.list(it) && !is.null(it$from) && identical(it$enabled, FALSE))
+        add("`fitting$init$from` names a fit to start from, but ",
+            "`fitting$init$enabled` is FALSE. Drop --no-init, or drop ",
+            "--init-from to fit without an initialisation stage.")
+
       if (!is.list(it)) {
         add("`fitting$init` must be a list, or absent.")
       } else if (isTRUE(it$enabled)) {
@@ -1131,10 +1215,13 @@ apply_inits <- function(fit, seeds, verbose = TRUE) {
 #' @param from_fit The fit supplying estimates.
 #' @param to_fit A fit of the target model, used for its parameter ordering.
 #' @param verbose Report how many parameters carried over.
+#' @param from What to call the source in that report. The default suits the
+#'   two stage run; a resumed fit is not an initialisation fit and says so.
 #'
 #' @return A `marssMLE` for the target model carrying the transferred values.
 #' @export
-transfer_params <- function(from_fit, to_fit, verbose = TRUE) {
+transfer_params <- function(from_fit, to_fit, verbose = TRUE,
+                            from = "the initialisation fit") {
 
   src <- MARSSvectorizeparam(from_fit)
   dst <- MARSSvectorizeparam(to_fit)
@@ -1146,7 +1233,7 @@ transfer_params <- function(from_fit, to_fit, verbose = TRUE) {
 
   if (verbose) {
     message("Transferred ", length(common), " of ", length(dst),
-            " parameters from the initialisation fit.")
+            " parameters from ", from, ".")
     if (length(kept))
       message("  left at defaults (not estimable in that stage): ",
               paste(kept, collapse = ", "))
@@ -1217,11 +1304,44 @@ fit_marss <- function(md, model_list, config, outdir, verbose = TRUE) {
     trace
   }
 
+  # ---- a fit to start from -------------------------------------------------
+  # Either replaces stage 1 with one already on disk, or picks up where a stage
+  # 2 left off. Both are the same mechanism -- load a fit, transfer its
+  # parameters by name into this model, start there -- and differ only in which
+  # file is loaded and what the trace calls it.
+  loaded      <- NULL
+  start_stage <- NULL
+  if (!is.null(init_cfg$from) || !is.null(config$fitting$resume_from)) {
+
+    resuming    <- !is.null(config$fitting$resume_from)
+    start_stage <- if (resuming) "resume" else "init"
+    src <- .resolve_fit_path(
+      if (resuming) config$fitting$resume_from else init_cfg$from,
+      prefer = if (resuming) "chunk" else "init")
+
+    if (verbose) message("Starting from ", src, " ...")
+    loaded <- readRDS(src)
+    if (!inherits(loaded, "marssMLE"))
+      stop("Not a fitted MARSS model: ", src, call. = FALSE)
+    .check_same_data(loaded, y, paste0("The fit at ", src))
+
+    # Copied in so the new run directory is self-contained, the way every other
+    # run directory in this project is.
+    file.copy(src, file.path(outdir, if (resuming) "fit_resumed.rds"
+                                     else "fit_init.rds"), overwrite = TRUE)
+    trace <- record(trace, start_stage, loaded$method %||% "?", NA_integer_,
+                    loaded)
+  }
+
   # ---- least squares warm start --------------------------------------------
   # Feeds whichever fit runs first. Starting the seasonal terms at zero is
   # expensive for every method, not just EM.
+  #
+  # A loaded fit supersedes it: `seeds` is consumed only by stage 1 and by the
+  # branch of stage 2 that runs when there is no fit to start from, so with one
+  # loaded these regressions would be fit and then discarded.
   seeds <- NULL
-  if (isTRUE(config$inits$enabled)) {
+  if (isTRUE(config$inits$enabled) && is.null(loaded)) {
     if (verbose) message("Fitting warm start regressions ...")
     seeds <- build_inits_seeds(md, config, verbose = verbose)
   }
@@ -1231,8 +1351,10 @@ fit_marss <- function(md, model_list, config, outdir, verbose = TRUE) {
   }
 
   # ---- stage 1: initialisation ---------------------------------------------
-  init_fit <- NULL
-  if (isTRUE(init_cfg$enabled)) {
+  # A loaded fit stands in for whichever stage it came from, so stage 2 needs no
+  # branch of its own: it already knows how to start from an `init_fit`.
+  init_fit <- loaded
+  if (isTRUE(init_cfg$enabled) && is.null(loaded)) {
 
     icfg  <- .init_config(config)
     imod  <- build_marss_model(md, icfg)
@@ -1272,12 +1394,43 @@ fit_marss <- function(md, model_list, config, outdir, verbose = TRUE) {
     # The ordering fit gives the full model's parameter layout; the values then
     # come from stage 1 wherever the names line up.
     inits <- stats::coef(
-      transfer_params(init_fit, ordering_fit(model_list), verbose = verbose),
+      transfer_params(init_fit, ordering_fit(model_list), verbose = verbose,
+                      from = if (identical(start_stage, "resume"))
+                        "the resumed fit" else "the initialisation fit"),
       type = "list")
   } else if (!is.null(seeds)) {
     if (verbose) message("Recovering the parameter ordering ...")
     inits <- stats::coef(apply_inits(ordering_fit(model_list), seeds,
                                      verbose = verbose), type = "list")
+  }
+
+  # ---- where B starts ------------------------------------------------------
+  # B is free here, and nothing above sets it: stage 1 holds it at a fixed value
+  # so it is not a parameter there and has no name to transfer, and the warm
+  # start seeds only the seasonal terms. Left alone it would inherit whatever
+  # the throwaway ordering fit reached in two EM iterations from MARSS's own
+  # default of 1 -- a random walk, and an arbitrary place to begin that moves
+  # whenever `warmup_controls` is touched. Under a method that cannot estimate B
+  # that arbitrary value is also the answer, reported as though it had been
+  # estimated.
+  #
+  # So every method starts B where the config says, at the same value stage 1
+  # held it at. Only the first chunk is seeded; later chunks continue from the
+  # one before.
+  #
+  # A resumed fit is the exception. Unlike an initialisation fit it does carry
+  # an estimated B, which transfers by name like everything else, and resetting
+  # it to the configured start would throw away the very progress the resume
+  # exists to keep.
+  if (!is.null(init_cfg$B_values) && is.null(config$structure$B_fixed) &&
+      !identical(start_stage, "resume")) {
+    b_names <- .b_param_names(config)
+    b_vals  <- .resolve_b_values(b_names, init_cfg$B_values)
+    if (is.null(inits)) inits <- list()
+    inits$B <- matrix(b_vals, ncol = 1, dimnames = list(b_names, NULL))
+    if (verbose)
+      message("B starts at ",
+              paste(sprintf("%s=%s", b_names, b_vals), collapse = ", "), ".")
   }
 
   fit <- NULL

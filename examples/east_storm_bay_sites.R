@@ -13,7 +13,7 @@
 ### assumptions that go into the fit.
 ###
 ### Jack H. Buckner, Oregon State University, 08/30/2026
-### Generated with Claude Code
+### 
 #############################################################
 #############################################################
 
@@ -45,9 +45,9 @@
 ### that it changes the fit and makes it non-comparable with
 ### the runs already in models/.
 ############################################################
-input      <- "outputs/tasi_salmon_20_yrs_2026-08-29/marss_inputs.rds"
-sites      <- c("CB001", "CB008", "SF001", "SF025", "SF050")
-start_date <- "2013-01-01"
+input      <- "examples/data/marss_inputs.rds"
+sites      <- c("CB001",  "SF054", "SF044", "SF017","SF052")
+start_date <- "2006-01-01"
 end_date   <- NULL
 
 data_params <- list(
@@ -59,7 +59,7 @@ data_params <- list(
 ############################################################
 ### Scaling of the observations.
 ###
-### The optimisers are better behaved when the observations
+### The optimizers are better behaved when the observations
 ### are close to unit scale. Scaling is done per site: every
 ### instrument at a site is centred and scaled by the mean
 ### and standard deviation of one reference instrument at
@@ -112,7 +112,7 @@ scaling_params <- list(enabled = enabled, variable = variable)
 ### identification note in R/marss_matrix_functions.R.
 ############################################################
 state_structure <- "site_plus_factors"
-m_factors       <- 2
+m_factors       <- 3
 
 
 ############################################################
@@ -183,12 +183,12 @@ instruments <- list(
     error = "sigma_2_insitu", day_effect = FALSE, site_state = TRUE),
   lst_sst_clean = list(
     tag = "lst", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_lst", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_lst", day_effect = FALSE, site_state = TRUE),
   eco_sst_v002_clean = list(
     tag = "eco", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_eco", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_eco", day_effect = FALSE, site_state = TRUE),
   modis_sst = list(
-    tag = "modis", intercept = "site+instrument", seasonality = "shared",
+    tag = "modis", intercept = "site", seasonality = "shared",
     error = "sigma_2_modis", day_effect = FALSE, site_state = TRUE),
   mur_sst = list(
     tag = "mur", intercept = "zero", seasonality = "independent",
@@ -293,7 +293,7 @@ inits_params <- list(
 method <- "kem"
 
 controls <- list(
-
+  
   kem = list(
     trace               = 1,
     maxit               = 20,
@@ -302,14 +302,14 @@ controls <- list(
     conv.test.slope.tol = 0.5,
     safe                = TRUE     # slower, more robust
   ),
-
+  
   BFGS = list(
     trace  = 0,
     maxit  = 5000,
     REPORT = 100,
     reltol = 1e-8
   ),
-
+  
   TMB = list(
     trace      = 0,
     maxit      = 5000,
@@ -339,31 +339,18 @@ chunks          <- 75
 ### estimated -- on a test series with a true rho of 0.6 it
 ### returns exactly 1.0000. So B is held at `B_values` and
 ### removed from the parameter set, which at least makes what
-### was and was not estimated legible from the fit.
-###
-### `B_values` governs both stages. Stage 1 holds B fixed
-### there, and the final fit -- where B is free again --
-### starts from it, whichever method that fit uses. Without
-### that the final fit would begin B wherever the throwaway
-### ordering fit happened to leave it after two EM iterations
-### from MARSS's own default of 1, which is a random walk and
-### an arbitrary starting point that shifts whenever
-### `warmup_controls` is touched. Under TMB it is not merely a
-### starting point but the answer.
-###
-### That makes B_values a modelling choice rather than a
-### tuning knob. 0.975 is strongly persistent yet stationary:
-### near-shore temperature anomalies decay on the scale of
-### weeks rather than days, and a value near 1 reflects that
-### without letting the states wander as a random walk would.
-### A named list, e.g. list(rho_chi = 0.975, rho_eta = 0.99),
-### sets the site and factor blocks separately.
+### was and was not estimated legible from the fit. That
+### makes B_values a modelling choice, not a tuning knob:
+### 0.9 is strongly persistent day to day but stationary, so
+### the states of this stage stay well behaved. A named list,
+### e.g. list(rho_chi = 0.9, rho_eta = 0.95), sets the site
+### and factor blocks separately.
 ###
 ### Day effects are dropped, for the same reason the direct
 ### optimisers refuse them: they put a shared covariance in
 ### the off-diagonal of R. Dropping them is safe here in a
-### way it would not be for the final fit, because the day
-### effect covariances are then simply not among the
+### way it would not be for the final fit, because B and the
+### day effect covariances are then simply not among the
 ### parameters transferred -- they keep their own starting
 ### values in the second stage.
 ###
@@ -372,7 +359,7 @@ chunks          <- 75
 ############################################################
 enabled       <- TRUE
 init_method   <- "TMB"      # distinct name: `method` above is the final fit
-B_values      <- 0.975
+B_values      <- list(rho_chi = 0.9, rho_eta = 0.98)
 init_controls <- list(
   trace      = 0,
   maxit      = 5000,
@@ -384,52 +371,10 @@ init_params <- list(
   B_values = B_values, controls = init_controls
 )
 
-
-############################################################
-### Starting from a fit already on disk.
-###
-### A fit is expensive and a run directory keeps every stage
-### of it, so neither stage has to be paid for twice.
-###
-### `init$from` names a saved initialisation fit -- a run
-### directory, or a fit_init.rds -- to use in place of
-### running stage 1 again. This is safe across final methods
-### because stage 1 does not depend on one: it always holds B
-### fixed, always drops the day effects, and always uses
-### `init$method`, whatever `method` above says. A saved
-### stage 1 is reusable as long as `data`, `scaling`,
-### `structure` and this block are unchanged, and the run
-### refuses to start if the observations do not match.
-###
-### `resume_from` names a saved final fit -- a run directory,
-### or a fit_chunk_NN.rds -- to continue from. Use it for a
-### run that stopped at the chunk limit while still climbing,
-### or to hand a converged fit to a different optimiser.
-###
-### Both transfer estimates by parameter name, so the model
-### being fit does not have to be the one that produced them.
-### The case worth understanding: a fit produced under BFGS
-### had to have the day effects dropped, and continuing it
-### under EM with them on is the natural next step. Those two
-### covariances have no counterpart in the saved fit, so they
-### are left at their defaults and reported as such -- which
-### is the same thing that happens between the two stages of
-### an ordinary run.
-###
-### The command line flags --init-from and --resume-from set
-### these; only one of the two may be given.
-############################################################
-init_from   <- NULL
-resume_from <- NULL
-
-# Appended rather than set with `$<-`, which would silently do nothing when the
-# value is NULL.
-init_params <- c(init_params, list(from = init_from))
-
 fitting_params <- list(
   method = method, controls = controls,
   warmup_controls = warmup_controls, chunks = chunks,
-  init = init_params, resume_from = resume_from
+  init = init_params
 )
 
 
@@ -503,7 +448,7 @@ reconstruction_params <- list(
 ### The command line flags --outdir and --run-name override
 ### these values.
 ############################################################
-output_root <- "models"
+output_root <- "examples/models/east_storm_bay"
 run_name    <- NULL
 
 output_params <- list(output_root = output_root, run_name = run_name)

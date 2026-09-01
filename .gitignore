@@ -5,9 +5,13 @@ outputs/
 42/
 data/
 models/
+examples/models
+Macquarie_harbor
+
 
 # R session and device leftovers
 .Rhistory
 .RData
 .Rproj.user/
 Rplots.pdf
+.DS_Store

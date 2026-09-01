@@ -41,7 +41,7 @@ ROOT   <- normalizePath(if (is.na(SCRIPT)) getwd() else dirname(dirname(SCRIPT))
 .from_root   <- function(path) if (.is_absolute(path)) path else file.path(ROOT, path)
 
 DEFAULTS <- list(
-  config  = file.path(ROOT, "parameters", "model.R"),
+  config  = file.path(ROOT, "parameters", "example_model.R"),
   outroot = file.path(ROOT, "models")
 )
 
@@ -79,8 +79,17 @@ Options:
   --init-method NAME Method for the fast initialisation stage, which fits a
                      reduced model (B fixed, no day effects) and hands its
                      estimates to the final fit. Default 'TMB'.
-  --init-B VALUE     Value B is held at during initialisation. Default 0.9.
+  --init-B VALUE     Value B is held at during initialisation, and the value
+                     the final fit starts B from. Default 0.975.
   --no-init          Skip the initialisation stage and fit directly.
+  --init-from PATH   Start from a saved initialisation fit instead of running
+                     the stage again: a run directory, or a fit_init.rds. Its
+                     estimates are transferred by name, so the final --method
+                     may differ from the one that run used.
+  --resume-from PATH Start the final fit from a saved fit: a run directory, or
+                     a fit_chunk_NN.rds. Continues a run that hit the chunk
+                     limit, or hands a converged fit to another optimiser.
+                     Mutually exclusive with --init-from.
   --chunks N         Maximum number of restarted fitting chunks.
   --maxit N          Iterations per chunk, for the selected method.
   --no-scaling       Fit the observations in degrees C rather than scaling them.
@@ -93,7 +102,9 @@ Options:
   --help             Show this message and exit.
 
 Outputs, under the output directory:
-  fit_init.rds              the initialisation stage fit, if one ran
+  fit_init.rds              the initialisation stage fit, if one ran, or a copy
+                            of the one --init-from named
+  fit_resumed.rds           a copy of the fit --resume-from started from
   fit_chunk_NN.rds          the fitted model after each chunk
   loglik.csv                stage, method, log likelihood and iteration count
   observations.rds          the observation matrix and its row keys
@@ -131,13 +142,14 @@ parse_args <- function(argv) {
                structure = NULL, m_factors = NULL, method = NULL,
                chunks = NULL, maxit = NULL,
                init = NA, init_method = NULL, init_B = NULL,
+               init_from = NULL, resume_from = NULL,
                scaling = NA, inits = NA, day_effects = NA, figures = TRUE,
                overwrite = FALSE, verbose = TRUE)
 
   takes_value <- c("--config", "--input", "--outdir", "--run-name", "--sites",
                    "--start-date", "--end-date", "--structure", "--m-factors",
                    "--method", "--chunks", "--maxit", "--init-method",
-                   "--init-B")
+                   "--init-B", "--init-from", "--resume-from")
 
   as_count <- function(flag, val) {
     n <- suppressWarnings(as.integer(val))
@@ -193,6 +205,8 @@ parse_args <- function(argv) {
       "--maxit"      = opts$maxit     <- as_count(a, val),
       "--init-method" = opts$init_method <- val,
       "--init-B"     = opts$init_B    <- as_number(a, val),
+      "--init-from"  = opts$init_from <- val,
+      "--resume-from" = opts$resume_from <- val,
       "--no-init"    = opts$init      <- FALSE,
       "--no-scaling" = opts$scaling   <- FALSE,
       "--no-warm-start" = opts$inits  <- FALSE,
@@ -207,6 +221,14 @@ parse_args <- function(argv) {
     )
     i <- i + 1L
   }
+
+  # Caught here rather than in validate_model_config() so the message names the
+  # flags the user actually typed.
+  if (!is.null(opts$init_from) && !is.null(opts$resume_from))
+    stop("--init-from and --resume-from both name a fit to start from. Use ",
+         "--init-from to replace the initialisation stage, or --resume-from ",
+         "to continue a final fit.", call. = FALSE)
+
   opts
 }
 
@@ -235,6 +257,11 @@ apply_overrides <- function(cfg, opts) {
   if (identical(opts$init, FALSE))          cfg$fitting$init$enabled  <- FALSE
   if (!is.null(opts$init_method))           cfg$fitting$init$method   <- opts$init_method
   if (!is.null(opts$init_B))                cfg$fitting$init$B_values <- opts$init_B
+
+  # Resolved against the project root like every other path, so the same command
+  # names the same fit whatever directory it is run from.
+  if (!is.null(opts$init_from))    cfg$fitting$init$from   <- .from_root(opts$init_from)
+  if (!is.null(opts$resume_from))  cfg$fitting$resume_from <- .from_root(opts$resume_from)
 
   if (!is.null(opts$chunks))               cfg$fitting$chunks   <- opts$chunks
   if (!is.null(opts$maxit)) {

@@ -60,6 +60,44 @@
                     design = "design.rds")
 
 
+#' Recover a fitted parameter block with its names attached
+#'
+#' The estimates live in `fit$par$<which>`, a one column matrix, but whether it
+#' carries row names depends on the optimiser: TMB and BFGS return them, and the
+#' EM algorithm does not. Since `kem` is this project's default method, reading
+#' `rownames(fit$par$A)` directly works on some runs and fails on others.
+#'
+#' The names are always available as the column names of `fit$marss$free`, one
+#' per estimated parameter and in the same order as the rows of `par`. Where
+#' both are present they are identical -- verified across kem, BFGS and TMB fits
+#' -- so taking them from `free` is simply the form that is always there.
+#'
+#' @param fit A fitted `marssMLE`.
+#' @param which A parameter block: "A" or "Z".
+#' @return A one column matrix of estimates with row names.
+.par_named <- function(fit, which) {
+
+  p <- fit$par[[which]]
+  if (is.null(p)) p <- matrix(numeric(0), ncol = 1)
+
+  # No free parameters at all is a legitimate model -- every intercept fixed,
+  # say -- and the callers that allow it handle an empty set themselves.
+  if (!nrow(p)) return(matrix(numeric(0), ncol = 1,
+                              dimnames = list(character(0), NULL)))
+
+  nms <- rownames(p)
+  if (is.null(nms)) nms <- dimnames(fit$marss$free[[which]])[[2]]
+
+  if (is.null(nms) || length(nms) != nrow(p))
+    stop("Cannot recover parameter names for `", which, "` from this fit: it ",
+         "has ", nrow(p), " estimate(s) and ",
+         if (is.null(nms)) "no names" else paste(length(nms), "name(s)"),
+         ".\nThis is not a fit produced by R/run_model.R.", call. = FALSE)
+
+  matrix(p[, 1], ncol = 1, dimnames = list(nms, NULL))
+}
+
+
 #' Pull named parameters out of a fitted A
 #'
 #' The reconstruction locates parameters by name rather than by position, the
@@ -78,19 +116,14 @@
 #' the right value rather than a failure. A partially present set is still an
 #' error, because that can only mean the names were built wrongly.
 #'
-#' @param A A fitted `par$A`, a one column matrix with row names.
+#' @param A A fitted `par$A` with its names attached, from `.par_named()`.
 #' @param nms The parameter names to pull, in order.
 #' @param what What the names are, for the error message.
 #' @param optional Allow the entire set to be absent, returning zeros.
 #' @return A numeric vector as long as `nms`.
 .coef_by_name <- function(A, nms, what = "parameter", optional = FALSE) {
 
-  rn <- rownames(A)
-  if (is.null(rn))
-    stop("The fitted `par$A` has no row names, so ", what, " cannot be located ",
-         "by name. This is not a fit produced by R/run_model.R.", call. = FALSE)
-
-  absent <- setdiff(nms, rn)
+  absent <- setdiff(nms, rownames(A))
   if (!length(absent)) return(as.numeric(A[nms, 1]))
 
   if (optional && length(absent) == length(nms)) return(rep(0, length(nms)))
@@ -156,7 +189,7 @@
     stop("`tri_from_names()` not found. Source R/marss_matrix_functions.R ",
          "first.", call. = FALSE)
 
-  tri_from_names(fit$par$Z, nrows = n_site, ncols = m_factors)
+  tri_from_names(.par_named(fit, "Z"), nrows = n_site, ncols = m_factors)
 }
 
 
@@ -201,7 +234,7 @@
 
   n_site <- design$n_site
   n_harm <- nrow(harm)
-  A      <- fit$par$A
+  A      <- .par_named(fit, "A")
   label  <- if (is.null(tag)) "site" else tag
 
   # ---- seasonal cycle ------------------------------------------------------
