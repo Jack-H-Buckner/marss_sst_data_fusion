@@ -45,8 +45,8 @@
 ### that it changes the fit and makes it non-comparable with
 ### the runs already in models/.
 ############################################################
-input      <- "outputs/tasi_salmon_20_yrs_2026-08-29/marss_inputs.rds"
-sites      <- c("CB001", "CB004", "SF001", "SF013", "SF007","SF025","SF008")
+input      <- "examples/data/marss_inputs.rds"
+sites      <- c("CB001", "SF001", "SF013", "SF025", "SF008")
 start_date <- "2006-01-01"
 end_date   <- NULL
 
@@ -290,7 +290,7 @@ inits_params <- list(
 ### real fit uses, since the ordering is a property of the
 ### model rather than of the optimiser.
 ############################################################
-method <- "BFGS"
+method <- "kem"
 
 controls <- list(
   
@@ -359,7 +359,7 @@ chunks          <- 75
 ############################################################
 enabled       <- TRUE
 init_method   <- "TMB"      # distinct name: `method` above is the final fit
-B_values      <- 0.9
+B_values      <- list(rho_chi = 0.9, rho_eta = 0.98)
 init_controls <- list(
   trace      = 0,
   maxit      = 5000,

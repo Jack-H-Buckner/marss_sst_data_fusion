@@ -161,17 +161,18 @@ chunks          <- 75
 
 ############################################################
 ### Initialisation stage. A fast TMB pass on a reduced model
-### supplies starting values for the fit above. See model.R
-### for why B has to be held fixed and the day effects
-### dropped for that stage.
+### supplies starting values for the fit above. See
+### example_model.R for why B has to be held fixed and the day
+### effects dropped for that stage, and for why `B_values`
+### also sets where the final fit starts B.
 ###
 ### Under this structure the only free entry of B is `rho`,
-### so a scalar covers it; list(rho = 0.9) would be the
+### so a scalar covers it; list(rho = 0.975) would be the
 ### equivalent named form.
 ############################################################
 enabled       <- TRUE
 init_method   <- "TMB"      # distinct name: `method` above is the final fit
-B_values      <- 0.9
+B_values      <- 0.975
 init_controls <- list(
   trace      = 0,
   maxit      = 5000,
