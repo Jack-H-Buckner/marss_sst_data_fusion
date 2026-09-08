@@ -1,3 +1,8 @@
+### ------------------------------------------------------
+### UPDATED 2026-09-04, NEEDS RE-REVIEW: validation holdout
+### (`data$sites_validation`). Newer than your last review of
+### this file. Delete this block once you have re-read it.
+### ------------------------------------------------------
 #############################################################
 #############################################################
 ###
@@ -32,6 +37,17 @@
 ### site set is the main lever on run time, since the number
 ### of free parameters grows with it.
 ###
+### `sites_validation` is a subset of `sites` held back for
+### validation: those sites are still fitted, but their in
+### situ series is dropped from the observation matrix, so
+### the reconstruction there rests on the satellites alone.
+### The withheld observations are written to validation.csv
+### in the run directory, keyed the same way as states.csv.
+### NULL fits every site with everything it has.
+###
+### `validation_variables` is what gets withheld, defaulting
+### to "insitu_sst".
+###
 ### `start_date` and `end_date` trim the time axis. The early
 ### record is in situ and MUR only, so a later start buys a
 ### denser observation matrix at the cost of years of data.
@@ -50,8 +66,14 @@ sites      <- c("CB001", "CB008", "SF001", "SF025", "SF050")
 start_date <- "2013-01-01"
 end_date   <- NULL
 
+# e.g. a couple of the sites above, to hold their in situ record back.
+sites_validation     <- NULL
+validation_variables <- "insitu_sst"
+
 data_params <- list(
   input = input, sites = sites,
+  sites_validation = sites_validation,
+  validation_variables = validation_variables,
   start_date = start_date, end_date = end_date
 )
 

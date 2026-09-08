@@ -29,7 +29,7 @@
 ###
 ### Jack H. Buckner, Oregon State University, 09/01/2026
 ### Generated with Claude Code
-###
+### Reviewed JHB 09/03/2026
 #############################################################
 #############################################################
 
@@ -70,9 +70,9 @@ ROOT   <- normalizePath(if (is.na(SCRIPT)) getwd() else dirname(dirname(SCRIPT))
 ############################################################
 MODELS      <- c("east_storm_bay", "west_storm_bay", "macquarie_harbor")
 MODELS_ROOT <- file.path(ROOT, "examples", "models")
-STATES_FILE <- "states.csv"
+STATES_FILES <- c("states.csv","states_mur_only.csv")
 SITES_FILE  <- file.path(ROOT, "data", "raw", "site_locations_combined.csv")
-OUTPUT      <- file.path(MODELS_ROOT, "states_combined.csv")
+OUTPUT      <- file.path(MODELS_ROOT, "tasi_temps_low_and_high_res.csv")
 
 
 ############################################################
@@ -90,9 +90,9 @@ latest_run <- function(model) {
     stop("No such model directory: ", model_dir, call. = FALSE)
 
   runs <- list.dirs(model_dir, recursive = FALSE, full.names = TRUE)
-  runs <- runs[file.exists(file.path(runs, STATES_FILE))]
+  runs <- runs[file.exists(file.path(runs, STATES_FILES[1]))]
   if (!length(runs))
-    stop("No run under ", model_dir, " holds a ", STATES_FILE, call. = FALSE)
+    stop("No run under ", model_dir, " holds a ", STATES_FILES, call. = FALSE)
 
   sort(runs)[length(runs)]
 }
@@ -102,23 +102,32 @@ latest_run <- function(model) {
 ### Read one run's states, tagged with where it came from.
 ############################################################
 read_states <- function(model) {
-  run <- latest_run(model)
-  x   <- utils::read.csv(file.path(run, STATES_FILE), stringsAsFactors = FALSE)
-  x$date <- as.Date(x$date)
-
-  # The modal gap between consecutive dates at one site; a run written on an
-  # uneven grid reports the step it mostly uses, which is all this line is for.
-  gaps <- diff(sort(unique(x$date)))
-  step <- if (length(gaps)) as.integer(names(which.max(table(gaps)))) else NA
-
-  message(sprintf("  %-17s %-33s %6d rows, %d sites, %d-day step, %s to %s",
-                  model, basename(run), nrow(x), length(unique(x$site)),
-                  step, min(x$date), max(x$date)))
-
-  data.frame(model = model, run = basename(run), x, stringsAsFactors = FALSE)
+  ls <- list()
+  i <- 0
+  for(states_file in STATES_FILES){
+    i <- i +1
+    run <- latest_run(model)
+    print(run)
+    x   <- utils::read.csv(file.path(run, states_file), stringsAsFactors = FALSE)
+    x$date <- as.Date(x$date)
+  
+    # The modal gap between consecutive dates at one site; a run written on an
+    # uneven grid reports the step it mostly uses, which is all this line is for.
+    gaps <- diff(sort(unique(x$date)))
+    step <- if (length(gaps)) as.integer(names(which.max(table(gaps)))) else NA
+  
+    message(sprintf("  %-17s %-33s %6d rows, %d sites, %d-day step, %s to %s",
+                    model, basename(run), nrow(x), length(unique(x$site)),
+                    step, min(x$date), max(x$date)))
+  
+    ls[[i]] <- data.frame(model = model, run = basename(run), x, stringsAsFactors = FALSE)
+  }
+  do.call(rbind,ls)
 }
 
 message("Reading reconstructions:")
+print(MODELS)
+library(dplyr)
 states <- do.call(rbind, lapply(MODELS, read_states))
 
 

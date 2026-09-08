@@ -1,3 +1,25 @@
+#############################################################
+#############################################################
+###
+### Converts long format data into a time series matrix for
+### compatable with the MARSS library. 
+###
+### It generates a set of meta data to describe the locations
+### and measurements recorded in each row, and the date for 
+### each column. Values missing from the long format data set
+### are entered as NaN. 
+### A additional time series matrix of covariates is generated
+### to fit seasonal harmonics to the data (sin and cos functions).
+### The data are saved as RDS object ready to be loaded and 
+### used to define MARSS models. 
+###
+### Jack Buckner, Oregon State University, August 2026.
+### Generated with Claude code
+### Reviewed JHB 09/02/2026
+#############################################################
+#############################################################
+
+
 #' Convert a long-format observation table into a MARSS-ready time series matrix
 #'
 #' Rows are variable-by-site series, grouped into contiguous blocks by variable

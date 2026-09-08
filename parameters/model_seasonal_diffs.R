@@ -1,3 +1,8 @@
+### ------------------------------------------------------
+### UPDATED 2026-09-04, NEEDS RE-REVIEW: validation holdout
+### (`data$sites_validation`). Newer than your last review of
+### this file. Delete this block once you have re-read it.
+### ------------------------------------------------------
 #############################################################
 #############################################################
 ###
@@ -37,8 +42,14 @@ sites      <- c("CB001", "CB008", "SF001", "SF025", "SF050")
 start_date <- "2013-01-01"
 end_date   <- NULL
 
+# e.g. a couple of the sites above, to hold their in situ record back.
+sites_validation     <- NULL
+validation_variables <- "insitu_sst"
+
 data_params <- list(
   input = input, sites = sites,
+  sites_validation = sites_validation,
+  validation_variables = validation_variables,
   start_date = start_date, end_date = end_date
 )
 

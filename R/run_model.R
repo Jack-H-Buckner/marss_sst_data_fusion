@@ -1,4 +1,9 @@
 #!/usr/bin/env Rscript
+### ------------------------------------------------------
+### UPDATED 2026-09-04, NEEDS RE-REVIEW: validation holdout
+### (`data$sites_validation`). Newer than your last review of
+### this file. Delete this block once you have re-read it.
+### ------------------------------------------------------
 #############################################################
 #############################################################
 ###
@@ -65,6 +70,16 @@ Options:
                      Default: the config file stem plus today's date.
   --sites LIST       Comma separated site keys to fit, overriding the config.
                      Pass 'all' to fit every site present.
+  --sites-validation LIST
+                     Comma separated subset of --sites whose in situ series is
+                     withheld from the fit and written to validation.csv. Those
+                     sites are still fitted, from their satellite series alone.
+                     Pass 'none' to drop the config's holdout. A run that holds
+                     data out cannot --resume-from or --init-from one that does
+                     not: the saved fit is checked against the observations
+                     cell by cell, and they no longer match.
+  --validation-variables LIST
+                     What --sites-validation withholds. Default 'insitu_sst'.
   --start-date DATE  Earliest date to fit, YYYY-MM-DD. Pass 'none' to remove
                      the config's lower bound.
   --end-date DATE    Latest date to fit, YYYY-MM-DD. Pass 'none' to remove it.
@@ -111,6 +126,9 @@ Outputs, under the output directory:
   scales.rds                the constants that return predictions to degrees C
   dates.rds                 the date range the columns span
   design.rds                the model dimensions and parameterisation
+  validation.csv, .rds      the observations a holdout withheld, in degrees C,
+                            written only when --sites-validation or the config
+                            held something out
   states.csv, states.rds    reconstructed SST in degrees C, long format
   states_<tag>_only.*       the same as seen by one instrument alone, for each
                             instrument named in the config's `reconstruction`
@@ -133,12 +151,13 @@ Where a run is written is set by the `output` block of the config
 # ---------------------------------------------------------------------------
 parse_args <- function(argv) {
 
-  # `sites`, `start_date` and `end_date` use NA to mean "not supplied, use the
-  # config". A real NULL means "no restriction", which is why those are stored
-  # through `[` below: `opts$sites <- NULL` would drop the element instead of
-  # setting it.
+  # `sites`, `sites_validation`, `validation_variables`, `start_date` and
+  # `end_date` use NA to mean "not supplied, use the config". A real NULL means
+  # "no restriction", which is why those are stored through `[` below:
+  # `opts$sites <- NULL` would drop the element instead of setting it.
   opts <- list(config = NULL, input = NULL, outdir = NULL, run_name = NULL,
-               sites = NA, start_date = NA, end_date = NA,
+               sites = NA, sites_validation = NA, validation_variables = NA,
+               start_date = NA, end_date = NA,
                structure = NULL, m_factors = NULL, method = NULL,
                chunks = NULL, maxit = NULL,
                init = NA, init_method = NULL, init_B = NULL,
@@ -147,6 +166,7 @@ parse_args <- function(argv) {
                overwrite = FALSE, verbose = TRUE)
 
   takes_value <- c("--config", "--input", "--outdir", "--run-name", "--sites",
+                   "--sites-validation", "--validation-variables",
                    "--start-date", "--end-date", "--structure", "--m-factors",
                    "--method", "--chunks", "--maxit", "--init-method",
                    "--init-B", "--init-from", "--resume-from")
@@ -162,6 +182,12 @@ parse_args <- function(argv) {
     if (is.na(x) || !is.finite(x))
       stop(flag, " must be a number, got: ", val, call. = FALSE)
     x
+  }
+  # A comma separated list of keys, or NULL for "no restriction" -- which for
+  # --sites means every site, and for --sites-validation means no holdout.
+  as_keys_or_null <- function(val) {
+    if (tolower(val) %in% c("all", "none", "null", "")) return(NULL)
+    trimws(strsplit(val, ",", fixed = TRUE)[[1]])
   }
   as_date_or_null <- function(flag, val) {
     if (tolower(val) %in% c("none", "null", "")) return(NULL)
@@ -192,10 +218,11 @@ parse_args <- function(argv) {
       "--input"      = opts$input     <- val,
       "--outdir"     = opts$outdir    <- val,
       "--run-name"   = opts$run_name  <- val,
-      "--sites"      = opts["sites"]  <- list(
-                          if (tolower(val) %in% c("all", "none", "null", ""))
-                            NULL
-                          else trimws(strsplit(val, ",", fixed = TRUE)[[1]])),
+      "--sites"      = opts["sites"]  <- list(as_keys_or_null(val)),
+      "--sites-validation" =
+        opts["sites_validation"] <- list(as_keys_or_null(val)),
+      "--validation-variables" =
+        opts["validation_variables"] <- list(as_keys_or_null(val)),
       "--start-date" = opts["start_date"] <- list(as_date_or_null(a, val)),
       "--end-date"   = opts["end_date"]   <- list(as_date_or_null(a, val)),
       "--structure"  = opts$structure <- val,
@@ -240,6 +267,10 @@ apply_overrides <- function(cfg, opts) {
 
   if (!is.null(opts$input))                cfg$data$input       <- opts$input
   if (!identical(opts$sites, NA))          cfg$data["sites"]      <- list(opts$sites)
+  if (!identical(opts$sites_validation, NA))
+    cfg$data["sites_validation"] <- list(opts$sites_validation)
+  if (!identical(opts$validation_variables, NA))
+    cfg$data["validation_variables"] <- list(opts$validation_variables)
   if (!identical(opts$start_date, NA))     cfg$data["start_date"] <- list(opts$start_date)
   if (!identical(opts$end_date, NA))       cfg$data["end_date"]   <- list(opts$end_date)
 

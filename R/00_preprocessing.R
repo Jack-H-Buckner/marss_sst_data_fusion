@@ -1,3 +1,24 @@
+################################################################
+### Functions for filtering likely outliers from each time series
+### and converting temperature units.
+###
+### This module defines filters that remove physically implausible values
+### like sea surface temperatures exceeding 40C or falling below freezing. 
+### Other filters model the distribution of the SST data and remove outlier
+### that fall outside of the typical distribution and might represent cloud 
+### contamination not caught by the coastal_sst_data cloud filters. We also 
+### remove measurements during low wind conditions where the TIR measurements 
+### that capture sea surface skin temperatures might diverge from biologically
+### meaningful bulk se surface temperatures. As a final optional step we apply 
+### filters that compare multiple measurements to identify outliers where the to 
+### data sorue disagree. 
+### These four filtering steps are run as a data prepossessing pipeline 
+###
+### Jack Buckner, Oregon State University, August 30 2026
+### Drafted by Jack Buckner 
+### updated with Claude Code 
+### Reviewed JHB 09/01/2026
+################################################################
 library(dplyr)
 library(reshape2)
 library(ggplot2)

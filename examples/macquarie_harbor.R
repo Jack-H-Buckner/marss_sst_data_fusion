@@ -42,11 +42,15 @@
 ### situ series is dropped from the observation matrix, so
 ### the reconstruction there rests on the satellites alone.
 ### The withheld observations are written to validation.csv
-### in the run directory, keyed the same way as states.csv.
-### NULL fits every site with everything it has.
+### in the run directory, in degrees C and keyed the same way
+### as states.csv, so the two join on (site, date). Comparing
+### them is left to a separate analysis. NULL, the default,
+### fits every site with everything it has.
 ###
 ### `validation_variables` is what gets withheld, defaulting
-### to "insitu_sst".
+### to "insitu_sst". It may not name `scaling$variable`, and
+### it may not be held out at every site at once -- there
+### would be nothing left to estimate its error term from.
 ###
 ### `start_date` and `end_date` trim the time axis. The early
 ### record is in situ and MUR only, so a later start buys a
@@ -61,14 +65,16 @@
 ### that it changes the fit and makes it non-comparable with
 ### the runs already in models/.
 ############################################################
-input      <- "examples/data/marss_inputs.rds"
-sites      <- c("CB002", "SF039", "SF043", "SF036", "SF041","SF040")
-start_date <- "2006-01-01"
-end_date   <- NULL
+input      <- "examples/data_tasi/marss_inputs.rds"
+sites      <- c("Cape Sorell","North Liberty Point 133","Liberty Point Central Harbour 214",
+                "South Central Harbour 219", "North East Double Cove 220" )
 
-# e.g. a couple of the sites above, to hold their in situ record back.
-sites_validation     <- NULL
+sites_validation <- NULL
+
 validation_variables <- "insitu_sst"
+
+start_date <- "2006-10-01"
+end_date   <- NULL
 
 data_params <- list(
   input = input, sites = sites,
@@ -76,7 +82,6 @@ data_params <- list(
   validation_variables = validation_variables,
   start_date = start_date, end_date = end_date
 )
-
 
 ############################################################
 ### Scaling of the observations.
@@ -111,9 +116,7 @@ data_params <- list(
 ############################################################
 enabled  <- TRUE
 variable <- "mur_sst"
-
 scaling_params <- list(enabled = enabled, variable = variable)
-
 
 ############################################################
 ### Structure of the state model.
@@ -135,7 +138,6 @@ scaling_params <- list(enabled = enabled, variable = variable)
 ############################################################
 state_structure <- "site_plus_factors"
 m_factors       <- 2
-
 
 ############################################################
 ### How each instrument enters the observation model.
@@ -205,10 +207,10 @@ instruments <- list(
     error = "sigma_2_insitu", day_effect = FALSE, site_state = TRUE),
   lst_sst_clean = list(
     tag = "lst", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_lst", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_lst", day_effect = FALSE, site_state = TRUE),
   eco_sst_v002_clean = list(
     tag = "eco", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_eco", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_eco", day_effect = FALSE, site_state = TRUE),
   modis_sst = list(
     tag = "modis", intercept = "site", seasonality = "shared",
     error = "sigma_2_modis", day_effect = FALSE, site_state = TRUE),
