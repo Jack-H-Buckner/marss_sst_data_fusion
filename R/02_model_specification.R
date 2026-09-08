@@ -1,3 +1,8 @@
+### ------------------------------------------------------
+### UPDATED 2026-09-04, NEEDS RE-REVIEW: validation holdout
+### (`data$sites_validation`). Newer than your last review of
+### this file. Delete this block once you have re-read it.
+### ------------------------------------------------------
 #############################################################
 #############################################################
 ###
@@ -26,7 +31,7 @@
 ###
 ### Jack H. Buckner, Oregon State University, 08/30/2026
 ### Generated with Claude Code
-###
+### Reviewed JHB 09/02/2026
 #############################################################
 #############################################################
 
@@ -44,10 +49,43 @@ library(MARSS)
   match(x, sort(unique(x)))
 }
 
+# Internal: the rows a holdout withheld, as a long data frame. Keyed the same
+# way as the reconstruction in 03_reconstruct_states.R -- date, site, variable
+# -- so the two join on (site, date) whenever the comparison gets written.
+# Values come straight from `ts_matrix`, i.e. degrees C, never scaled.
+.withheld_long <- function(dat, rows, keep_cols) {
+
+  empty <- data.frame(date = as.Date(character(0)), site = character(0),
+                      variable = character(0), value = numeric(0),
+                      stringsAsFactors = FALSE)
+  if (!length(rows)) return(empty)
+
+  block <- dat$ts_matrix[rows, keep_cols, drop = FALSE]
+  dates <- as.Date(dat$col_dates)[keep_cols]
+
+  out <- data.frame(
+    date     = rep(dates, times = length(rows)),
+    site     = rep(dat$row_site_keys[rows], each = length(dates)),
+    variable = rep(dat$row_var_keys[rows],  each = length(dates)),
+    value    = as.vector(t(block)),
+    stringsAsFactors = FALSE)
+
+  # Empty cells of the padded grid are gaps in the record, not withheld data.
+  out <- out[!is.na(out$value), , drop = FALSE]
+  out <- out[order(out$variable, out$site, out$date), , drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
 # The intercept and seasonality parameterisations a config may name.
 .INTERCEPT_KINDS  <- c("site", "site+instrument", "independent", "zero")
 .SEASONALITY_KINDS <- c("shared", "independent")
 .STATE_STRUCTURES  <- c("site_plus_factors", "factors_only")
+
+# What `data$sites_validation` holds out when the config does not say. In situ
+# is the series a reconstruction is normally validated against, so it is the
+# default; `data$validation_variables` names something else.
+.VALIDATION_VARIABLES <- "insitu_sst"
 
 # Fitting methods MARSS accepts. "kem" is the EM algorithm; everything else
 # optimises the likelihood directly through optim() or nlminb(), which imposes
@@ -278,10 +316,82 @@ validate_model_config <- function(config, marss_inputs = NULL) {
               paste(sort(unique(known_sites)), collapse = ", "))
       }
     }
+    # The holdout: sites that are fitted, but with their in situ series kept out
+    # of the observation matrix so it survives untouched for later validation.
+    if (!is.null(dp$sites_validation)) {
+      if (!is.character(dp$sites_validation) || !length(dp$sites_validation)) {
+        add("`data$sites_validation` must be a character vector, or NULL for ",
+            "no holdout.")
+      } else {
+        if (!is.null(known_sites)) {
+          miss <- setdiff(dp$sites_validation, known_sites)
+          if (length(miss))
+            add("`data$sites_validation` names site(s) absent from the data: ",
+                paste(miss, collapse = ", "), ". Available: ",
+                paste(sort(unique(known_sites)), collapse = ", "))
+        }
+        # A validation site outside `data$sites` is not held out, it is simply
+        # not fitted -- almost certainly a mistake rather than an intent.
+        if (is.character(dp$sites)) {
+          outside <- setdiff(dp$sites_validation, dp$sites)
+          if (length(outside))
+            add("`data$sites_validation` must be a subset of `data$sites`; ",
+                "these are not fitted at all: ",
+                paste(outside, collapse = ", "))
+        }
+      }
+    }
+
+    vv <- dp$validation_variables
+    if (!is.null(vv)) {
+      if (!is.character(vv) || !length(vv)) {
+        add("`data$validation_variables` must be a character vector, or NULL ",
+            "for the default (", .VALIDATION_VARIABLES, ").")
+      } else if (!is.null(known_vars)) {
+        miss <- setdiff(vv, known_vars)
+        if (length(miss))
+          add("`data$validation_variables` names variable(s) absent from the ",
+              "data: ", paste(miss, collapse = ", "))
+      }
+    }
+
     for (k in c("start_date", "end_date")) {
       v <- dp[[k]]
       if (!is.null(v) && is.na(suppressWarnings(as.Date(v))))
         add("`data$", k, "` is not a date: ", v)
+    }
+  }
+
+  # ---- the holdout against the rest of the config --------------------------
+  if (is.list(dp) && is.character(dp$sites_validation) &&
+      length(dp$sites_validation)) {
+
+    held_vars <- dp$validation_variables %||% .VALIDATION_VARIABLES
+
+    # Scaling is per site from one reference instrument, so holding that
+    # reference out leaves the validation sites with no mean and sd to scale by.
+    if (isTRUE(config$scaling$enabled) &&
+        config$scaling$variable %in% held_vars)
+      add("`data$validation_variables` holds out '", config$scaling$variable,
+          "', which is `scaling$variable`. The validation sites would then ",
+          "have no scaling reference. Hold out a different variable, or fit ",
+          "with scaling disabled.")
+
+    # Holding out every row of an instrument leaves its error and intercept
+    # parameters with nothing to estimate them from, and `build_model_data()`
+    # would drop it from the model with only a warning.
+    if (!is.null(known_sites) && !is.null(known_vars)) {
+      fitted <- if (is.null(dp$sites)) rep(TRUE, length(known_sites)) else
+        known_sites %in% dp$sites
+      for (v in intersect(held_vars, known_vars[fitted])) {
+        left <- setdiff(unique(known_sites[fitted & known_vars == v]),
+                        dp$sites_validation)
+        if (!length(left))
+          add("The holdout takes every row of '", v,
+              "': no site would keep it. Its error and intercept parameters ",
+              "would have no data. Hold it out at fewer sites, or drop it ",
+              "from `structure$instruments`.")
+      }
     }
   }
 
@@ -571,6 +681,12 @@ validate_model_config <- function(config, marss_inputs = NULL) {
 #' sites 1..n, locates the rows belonging to each instrument, and scales the
 #' matrix.
 #'
+#' `data$sites_validation` names fitted sites whose `data$validation_variables`
+#' rows -- in situ by default -- are withheld from the matrix. Those sites are
+#' still fitted, from their satellite series alone, so the reconstruction there
+#' can be checked against data the model never saw. The withheld observations
+#' come back in `validation`.
+#'
 #' Scaling uses one pair of constants for the whole matrix, taken from a single
 #' reference series, so every series stays on a common scale and the estimated
 #' biases and loadings remain comparable across instruments. Those constants are
@@ -587,8 +703,10 @@ validate_model_config <- function(config, marss_inputs = NULL) {
 #' @return A list with `y` (the selected observations, unscaled), `y_fit` (what
 #'   is passed to MARSS), `d` (the harmonics on the same time axis), `scales`,
 #'   `dates`, `row_vars`, `row_site`, `row_site_index`, `rows_by_var`,
-#'   `sites_by_var`, `n_site`, `k_obs`, `n_harm` and `observations` (the
-#'   subsetted input, saved for the reconstruction step).
+#'   `sites_by_var`, `n_site`, `k_obs`, `n_harm`, `observations` (the
+#'   subsetted input, saved for the reconstruction step) and `validation`
+#'   (`sites`, `variables` and the withheld observations as a long data frame of
+#'   `date`, `site`, `variable`, `value`; zero rows when nothing is held out).
 #' @export
 build_model_data <- function(marss_inputs, config, verbose = TRUE) {
 
@@ -600,13 +718,48 @@ build_model_data <- function(marss_inputs, config, verbose = TRUE) {
     stop("`marss_inputs` is missing: ", paste(absent, collapse = ", "),
          call. = FALSE)
 
-  # ---- rows: site selection ------------------------------------------------
-  sites <- config$data$sites
-  rows_to_keep <- if (is.null(sites)) rep(TRUE, length(dat$row_site_keys)) else
+  # ---- rows: site selection and the validation holdout ---------------------
+  # Two separate ideas. `sites` says which sites are fitted at all;
+  # `sites_validation` names fitted sites whose in situ series is withheld, so
+  # the reconstruction there is driven by the satellites alone and can later be
+  # checked against observations the fit never saw.
+  #
+  # The withheld rows are dropped rather than filled with NA. Everything below
+  # -- row_vars, row_site_index, rows_by_var, and through them Z, A, R and every
+  # parameter name -- is derived from `rows_to_keep`, so dropping reindexes the
+  # model on its own, exactly as if those sites had no in situ record. Masking
+  # would instead leave an all-NA row carrying parameters nothing can estimate.
+  sites     <- config$data$sites
+  val_sites <- config$data$sites_validation
+  val_vars  <- config$data$validation_variables %||% .VALIDATION_VARIABLES
+
+  in_sites <- if (is.null(sites)) rep(TRUE, length(dat$row_site_keys)) else
     dat$row_site_keys %in% sites
+  held_out <- if (is.null(val_sites)) rep(FALSE, length(dat$row_site_keys)) else
+    dat$row_site_keys %in% val_sites & dat$row_var_keys %in% val_vars
+
+  rows_to_keep <- in_sites & !held_out
   if (!any(rows_to_keep))
     stop("No rows left after selecting sites: ",
-         paste(sites, collapse = ", "), call. = FALSE)
+         paste(sites, collapse = ", "),
+         if (any(held_out))
+           paste0("\nThe holdout removed every remaining row: ",
+                  paste(val_vars, collapse = ", "), " at ",
+                  paste(val_sites, collapse = ", "), "."),
+         call. = FALSE)
+
+  # A validation site with nothing left is not being validated, it has silently
+  # dropped out of the model and out of `n_site`.
+  if (any(held_out)) {
+    emptied <- setdiff(intersect(val_sites, dat$row_site_keys[in_sites]),
+                       dat$row_site_keys[rows_to_keep])
+    if (length(emptied))
+      stop("The holdout leaves no observations at all at: ",
+           paste(emptied, collapse = ", "),
+           ".\nThose sites carry only ", paste(val_vars, collapse = ", "),
+           ", so withholding it drops them from the model entirely rather ",
+           "than validating them.", call. = FALSE)
+  }
 
   # ---- columns: date selection ---------------------------------------------
   col_dates <- as.Date(dat$col_dates)
@@ -617,6 +770,14 @@ build_model_data <- function(marss_inputs, config, verbose = TRUE) {
     keep_cols <- keep_cols & col_dates <= as.Date(config$data$end_date)
   if (!any(keep_cols))
     stop("No columns left after applying the date range.", call. = FALSE)
+
+  # The withheld series, over the same dates the model is fitted to and in
+  # degrees C: taken from `ts_matrix` before any scaling, so it stays directly
+  # comparable to the reconstruction written by 03_reconstruct_states.R.
+  validation <- list(
+    sites     = val_sites,
+    variables = if (is.null(val_sites)) character(0) else val_vars,
+    data      = .withheld_long(dat, which(in_sites & held_out), keep_cols))
 
   y <- dat$ts_matrix[rows_to_keep, keep_cols, drop = FALSE]
   d <- dat$harmonics[, keep_cols, drop = FALSE]
@@ -731,6 +892,11 @@ build_model_data <- function(marss_inputs, config, verbose = TRUE) {
                       scales$variable, min(scales$mu), max(scales$mu),
                       min(scales$sigma), max(scales$sigma))
             else "disabled")
+    if (nrow(validation$data))
+      message("  holdout: ", paste(validation$variables, collapse = ", "),
+              " withheld at ", paste(validation$sites, collapse = ", "), " (",
+              format(nrow(validation$data), big.mark = ","),
+              " observations kept back for validation).")
   }
 
   list(y = y, y_fit = y_fit, d = d, scales = scales, dates = dates,
@@ -738,7 +904,7 @@ build_model_data <- function(marss_inputs, config, verbose = TRUE) {
        row_site_index = row_site_index,
        rows_by_var = rows_by_var, sites_by_var = sites_by_var,
        n_site = n_site, k_obs = k_obs, n_harm = n_harm,
-       observations = observations)
+       observations = observations, validation = validation)
 }
 
 
@@ -1485,6 +1651,11 @@ build_design <- function(md, config) {
        n_harmonics     = md$n_harm,
        instruments     = config$structure$instruments,
        reconstruction  = config$reconstruction,
+       # The holdout, so a finished run says which sites were fitted without
+       # their in situ series without anyone having to read config_used.R --
+       # which does not describe a run launched with --sites-validation.
+       sites_validation     = md$validation$sites,
+       validation_variables = md$validation$variables,
        method          = config$fitting$method %||% "kem",
        day_effects     = .day_effect_vars(config),
        init_method     = if (isTRUE(init$enabled)) init$method else NA_character_,
@@ -1500,6 +1671,10 @@ build_design <- function(md, config) {
 #' 03_reconstruct_states.R: the observation matrix and its row keys, the
 #' scaling constants needed to return predictions to degrees C, the date range
 #' the columns span, and the model dimensions.
+#'
+#' A run that held data out also writes `validation.csv` and `validation.rds`:
+#' the withheld observations in degrees C, keyed the same way as `states.csv`
+#' so the two join on `(site, date)`. Comparing them is not yet automated.
 #'
 #' @param md Output of `build_model_data()`.
 #' @param config The `model_config` list.
@@ -1521,8 +1696,19 @@ write_model_outputs <- function(md, config, outdir, verbose = TRUE) {
   saveRDS(md$dates,        paths[["dates"]])
   saveRDS(design,          paths[["design"]])
 
+  # Only when something was actually withheld: an empty validation.csv in a run
+  # directory would read as "the holdout found nothing", not "there was none".
+  if (!is.null(md$validation) && nrow(md$validation$data)) {
+    paths <- c(paths,
+               validation_csv = file.path(outdir, "validation.csv"),
+               validation_rds = file.path(outdir, "validation.rds"))
+    utils::write.csv(md$validation$data, paths[["validation_csv"]],
+                     row.names = FALSE)
+    saveRDS(md$validation$data, paths[["validation_rds"]])
+  }
+
   if (verbose)
-    message("Wrote observations.rds, scales.rds, dates.rds and design.rds.")
+    message("Wrote ", paste(basename(paths), collapse = ", "), ".")
 
   invisible(paths)
 }

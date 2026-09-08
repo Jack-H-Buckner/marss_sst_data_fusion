@@ -14,7 +14,8 @@
 ### Run with --help for the full option list.
 ###
 ### Jack H. Buckner, Oregon State University
-###
+### Generated with Claude Code
+### Reviewed JHB 09/02/2026
 #############################################################
 #############################################################
 

@@ -18,6 +18,10 @@
 ### grey / firebrick encoding come from there, so the two sets
 ### of figures cannot drift apart.
 ###
+### Jack H. Buckner, August 2026, Oregon State University 
+### Generated with Claude Code
+### reviewed JHB 9/1/26
+###
 #############################################################
 #############################################################
 

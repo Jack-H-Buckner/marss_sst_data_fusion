@@ -7,7 +7,12 @@ data/
 models/
 examples/models
 Macquarie_harbor
-
+*.csv
+*.rds
+*.png
+*.nc
+*.pdf
+*_log.txt
 
 # R session and device leftovers
 .Rhistory

@@ -42,11 +42,15 @@
 ### situ series is dropped from the observation matrix, so
 ### the reconstruction there rests on the satellites alone.
 ### The withheld observations are written to validation.csv
-### in the run directory, keyed the same way as states.csv.
-### NULL fits every site with everything it has.
+### in the run directory, in degrees C and keyed the same way
+### as states.csv, so the two join on (site, date). Comparing
+### them is left to a separate analysis. NULL, the default,
+### fits every site with everything it has.
 ###
 ### `validation_variables` is what gets withheld, defaulting
-### to "insitu_sst".
+### to "insitu_sst". It may not name `scaling$variable`, and
+### it may not be held out at every site at once -- there
+### would be nothing left to estimate its error term from.
 ###
 ### `start_date` and `end_date` trim the time axis. The early
 ### record is in situ and MUR only, so a later start buys a
@@ -61,14 +65,38 @@
 ### that it changes the fit and makes it non-comparable with
 ### the runs already in models/.
 ############################################################
-input      <- "examples/data/marss_inputs.rds"
-sites      <- c("CB002", "SF039", "SF043", "SF036", "SF041","SF040")
+input      <- "examples/data_nc_modis_imputed/marss_inputs.rds"
+sites      <- c("ism-secoora-noaa_nos_co_ops_8656",
+                "neuse-river-at-marker-7-modmo", 
+                "neuse-river-at-marker-15-modm", 
+                "neuse-river-at-marker-17-modm",
+                "neuse-river-at-marker-9-modmo",
+                "neuse-river-at-cm-22-fairfiel-2",
+                "neuse-river-at-marker-38-modm",
+                "neuse-river-at-marker-52-a-mo")
+
+
+
+sites_validation <- c("neuse-river-at-marker-7-modmo", 
+                      "neuse-river-at-marker-15-modm", 
+                      "neuse-river-at-marker-17-modm",
+                      "neuse-river-at-marker-9-modmo",
+                       "neuse-river-at-cm-22-fairfiel-2",
+                       "neuse-river-at-marker-38-modm",
+                       "neuse-river-at-marker-52-a-mo")
+
+# "neuse-river-at-cm-22-fairfiel-2",
+# "neuse-river-at-marker-38-modm",
+# "neuse-river-at-marker-52-a-mo"
+
+validation_variables <- "insitu_sst"
+
+
+
 start_date <- "2006-01-01"
 end_date   <- NULL
 
-# e.g. a couple of the sites above, to hold their in situ record back.
-sites_validation     <- NULL
-validation_variables <- "insitu_sst"
+
 
 data_params <- list(
   input = input, sites = sites,
@@ -134,7 +162,7 @@ scaling_params <- list(enabled = enabled, variable = variable)
 ### identification note in R/marss_matrix_functions.R.
 ############################################################
 state_structure <- "site_plus_factors"
-m_factors       <- 2
+m_factors       <- 3
 
 
 ############################################################
@@ -205,10 +233,10 @@ instruments <- list(
     error = "sigma_2_insitu", day_effect = FALSE, site_state = TRUE),
   lst_sst_clean = list(
     tag = "lst", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_lst", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_lst", day_effect = FALSE, site_state = TRUE),
   eco_sst_v002_clean = list(
     tag = "eco", intercept = "site+instrument", seasonality = "shared",
-    error = "sigma_2_eco", day_effect = TRUE, site_state = TRUE),
+    error = "sigma_2_eco", day_effect = FALSE, site_state = TRUE),
   modis_sst = list(
     tag = "modis", intercept = "site", seasonality = "shared",
     error = "sigma_2_modis", day_effect = FALSE, site_state = TRUE),
@@ -470,7 +498,7 @@ reconstruction_params <- list(
 ### The command line flags --outdir and --run-name override
 ### these values.
 ############################################################
-output_root <- "examples/models/macquarie_harbor"
+output_root <- "examples/models/north_carolina_modis_imputed"
 run_name    <- NULL
 
 output_params <- list(output_root = output_root, run_name = run_name)

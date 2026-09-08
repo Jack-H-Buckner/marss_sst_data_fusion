@@ -1,3 +1,6 @@
+<!-- UPDATED 2026-09-04, NEEDS RE-REVIEW: validation holdout (`data$sites_validation`).
+     Newer than the last review of this file. Delete this block once re-read. -->
+
 # Sea surface tempeaure data fusion with state space models 
 
 This package uses state space models to fuse multiple sources of ocean temperature data into on longterm time series. The primary goal of the model is to leverage high resolution thermal infared sensors to detect high temperature events in hear shore waters where standard ocean temperaute data products can be baised. 
@@ -360,6 +363,8 @@ parameter names would still match, so the transfer would otherwise be silently w
 | `--outdir PATH` | Output directory, used verbatim. Overrides everything below |
 | `--run-name NAME` | Run subdirectory name. Overrides the config's `run_name` |
 | `--sites LIST` | Comma separated site keys. Pass `all` for every site |
+| `--sites-validation LIST` | Sites fitted without their in situ series, held back for validation. Pass `none` for no holdout |
+| `--validation-variables LIST` | What the holdout withholds. Default `insitu_sst` |
 | `--start-date DATE`, `--end-date DATE` | Trim the time axis. Pass `none` to remove a bound |
 | `--structure NAME` | `site_plus_factors` or `factors_only` |
 | `--m-factors N` | Number of shared dynamic factors |
@@ -393,7 +398,10 @@ models/<run-name>/
   scales.rds           the constants that return predictions to degrees C
   dates.rds            the date range the columns span
   design.rds           n_site, m_factors, state_structure, n_harmonics,
-                       the instrument specification, method, day_effects
+                       the instrument specification, method, day_effects,
+                       and the holdout, if there was one
+  validation.csv/.rds  the observations a holdout withheld, in degrees C,
+                       written only when the run held something out
   states.csv/.rds      the fused reconstruction, in degrees C, long format
   states_mur_only.*    the same as MUR alone sees it, one file per instrument
                        named in `reconstruction$instruments`
@@ -412,6 +420,44 @@ Each is saved as it completes, so a run that is interrupted — or that is still
 after days of iterations — leaves a usable fit behind, and `loglik.csv` shows whether it
 is still improving. The run stops as soon as MARSS reports convergence, or at
 `fitting$chunks`; under TMB that is normally the first chunk.
+
+### Holding data back for validation
+
+`data$sites` decides which sites are fitted at all. `data$sites_validation`, a subset of
+it, decides which of those are fitted *without* their in situ record:
+
+```r
+sites            <- c("CB001", "SF001", "SF013", "SF025", "SF008")
+sites_validation <- c("SF013", "SF025")
+```
+
+The `insitu_sst` rows at SF013 and SF025 are dropped from the observation matrix before
+fitting — exactly as if those sites had no in situ record — while every satellite series
+they have stays in. The reconstruction there is therefore driven by the satellites alone,
+and can be compared against in situ data the model never saw.
+`data$validation_variables` names what is withheld; it defaults to `insitu_sst`.
+
+The withheld observations are not lost. They are written to `validation.csv` in the run
+directory, in degrees C, with the same `date`, `site`, `variable` keys `states.csv`
+carries, so the two join directly:
+
+```r
+states     <- read.csv("models/<run-name>/states.csv")
+validation <- read.csv("models/<run-name>/validation.csv")
+merge(states, validation, by = c("site", "date"))
+```
+
+**Comparing them is not yet automated** — no residuals, no skill scores. `validation.csv`
+is the handoff point, and how the comparison is done is still open.
+
+Two things the run will refuse. The holdout may not name `scaling$variable`: scaling is
+per site from that one reference, so withholding it would leave the validation sites with
+nothing to scale by. And it may not take every site's copy of a variable at once — the
+instrument's error and intercept parameters would have no data left to estimate them from.
+
+A holdout run also cannot `--resume-from` or `--init-from` a full-data run. The saved fit
+is checked against the observations cell by cell, and after a holdout they no longer
+match; the parameter names would still line up, so the transfer would be silently wrong.
 
 ### Scaling and the warm start
 
